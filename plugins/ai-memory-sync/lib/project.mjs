@@ -1,17 +1,25 @@
 // Per-project logic: config, modes, scaffold, sync, generated outputs.
-import { existsSync, lstatSync, mkdirSync, readdirSync, readlinkSync, realpathSync, unlinkSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, readdirSync, readlinkSync, unlinkSync } from "node:fs";
 import { basename, join, relative, resolve } from "node:path";
 import { envLiterals, mergeCounts, scrub } from "./scrub.mjs";
 import {
   CODEX_DIR,
   REPO_URL,
+  IS_WIN,
   STATE_DIR,
-  claudeMemoryDir,
+  claudeMemoryDirs,
   expandHome,
+  fwd,
   git,
   isDir,
+  lf,
+  nativePath,
+  pathKey,
   readJson,
   readText,
+  realPath,
+  samePath,
+  withEol,
   writeIfChanged,
 } from "./util.mjs";
 
@@ -128,16 +136,10 @@ export function setGitConfigMode(root, mode) {
 /** Other worktrees of the same repository that are in git mode (they share .git/info/exclude). */
 export function gitModeSiblings(root) {
   const out = git(root, ["worktree", "list", "--porcelain"]) ?? "";
-  const real = (p) => {
-    try {
-      return realpathSync(p);
-    } catch {
-      return resolve(p);
-    }
-  };
+  const real = realPath;
   const me = real(root);
-  const paths = out.split("\n").filter((l) => l.startsWith("worktree ")).map((l) => real(l.slice(9)));
-  return paths.filter((p) => p !== me && existsSync(p) && resolveModeNoGitConfig(p) === "git");
+  const paths = out.split("\n").filter((l) => l.startsWith("worktree ")).map((l) => real(nativePath(l.slice(9))));
+  return paths.filter((p) => !samePath(p, me) && existsSync(p) && resolveModeNoGitConfig(p) === "git");
 }
 
 function resolveModeNoGitConfig(root) {
@@ -236,12 +238,19 @@ export function agentsWithBlock(text, block) {
   return upsertBlock(t, block);
 }
 
-const symlinkTarget = (p) => {
+/**
+ * Target name of a symlink. With core.symlinks=false (the Git for Windows default without developer
+ * mode) a committed symlink is checked out as a small text file that holds the target path.
+ */
+const symlinkTarget = (p, root) => {
   try {
-    return lstatSync(p).isSymbolicLink() ? basename(readlinkSync(p)) : null;
+    if (lstatSync(p).isSymbolicLink()) return basename(readlinkSync(p));
   } catch {
     return null;
   }
+  const t = readText(p);
+  if (t != null && /^[\w.-]+\.md$/.test(t) && root && git(root, ["ls-files", "-s", "--", basename(p)])?.startsWith("120000")) return t;
+  return null;
 };
 
 const mdcGit = `---
@@ -319,14 +328,25 @@ export function plan(root, mode) {
   const warnings = [];
   const { block, notes } = buildBlock(root);
   const P = (rel) => join(root, rel);
-  const agentsText = readText(P("AGENTS.md"));
-  const claudeText = readText(P("CLAUDE.md"));
+  // Tracked files may be checked out with CRLF (core.autocrlf on Windows): edit as LF, write back
+  // with the file's own line endings.
+  const agentsRaw = readText(P("AGENTS.md"));
+  const claudeRaw = readText(P("CLAUDE.md"));
+  const agentsLink = symlinkTarget(P("AGENTS.md"), root);
+  const claudeLink = symlinkTarget(P("CLAUDE.md"), root);
+  const agentsText = agentsLink && agentsRaw === agentsLink ? readText(P(agentsLink)) : lf(agentsRaw);
+  const claudeText = claudeLink && claudeRaw === claudeLink ? readText(P(claudeLink)) : lf(claudeRaw);
 
   if (mode === "git") {
-    out.push({ path: P("AGENTS.md"), content: agentsWithBlock(agentsText, block) });
-    const linked = symlinkTarget(P("CLAUDE.md")) === "AGENTS.md" || symlinkTarget(P("AGENTS.md")) === "CLAUDE.md";
+    // AGENTS.md checked out as a symlink placeholder: the block goes into the real file instead.
+    const agentsFile = agentsLink && agentsRaw === agentsLink ? P(agentsLink) : P("AGENTS.md");
+    out.push({ path: agentsFile, content: withEol(readText(agentsFile), agentsWithBlock(lf(agentsText), block)) });
+    const linked = claudeLink === "AGENTS.md" || agentsLink === "CLAUDE.md";
     if (!linked && !/^@AGENTS\.md[ \t]*$/m.test(claudeText ?? "")) {
-      out.push({ path: P("CLAUDE.md"), content: `${(claudeText ?? "").trimEnd()}${claudeText?.trim() ? "\n\n" : ""}@AGENTS.md\n` });
+      out.push({
+        path: P("CLAUDE.md"),
+        content: withEol(claudeRaw, `${(claudeText ?? "").trimEnd()}${claudeText?.trim() ? "\n\n" : ""}@AGENTS.md\n`),
+      });
     }
     const cur = readText(P(MDC));
     if (ours(cur)) out.push({ path: P(MDC), content: mdcGit });
@@ -339,7 +359,8 @@ export function plan(root, mode) {
     const lines = [];
     if (agentsText != null && !/^@AGENTS\.md[ \t]*$/m.test(claudeText ?? "")) lines.push("@AGENTS.md");
     lines.push("@AGENTS.local.md");
-    out.push({ path: P("CLAUDE.local.md"), content: claudeLocalWith(readText(P("CLAUDE.local.md")), lines) });
+    const cl = readText(P("CLAUDE.local.md"));
+    out.push({ path: P("CLAUDE.local.md"), content: withEol(cl, claudeLocalWith(lf(cl), lines)) });
     // Codex: AGENTS.override.md replaces AGENTS.md in the same directory, so it carries AGENTS.md too.
     const ov = readText(P("AGENTS.override.md"));
     if (ours(ov)) {
@@ -358,7 +379,8 @@ export function plan(root, mode) {
       warnings.push(`not editing the shared .git/info/exclude: worktree ${siblings[0]} is in git mode. Local files here show as untracked; do not commit them.`);
     } else if (ex) {
       const entries = [`/${CTX}/`, `/${MDC}`, ...LOCAL_FILES.map((f) => `/${f}`), `/${CONFIG_FILE}`];
-      out.push({ path: ex, content: excludeWith(readText(ex), entries) });
+      const et = readText(ex);
+      out.push({ path: ex, content: withEol(et, excludeWith(lf(et), entries)) });
     }
   }
   return { files: out, warnings, notes, block };
@@ -411,11 +433,31 @@ function copyNotes(from, to, literals, counts, filter = () => true) {
   return changed;
 }
 
+const uniquePaths = (list) => {
+  const seen = new Set();
+  return list.filter((p) => !seen.has(pathKey(p)) && seen.add(pathKey(p)));
+};
+
+/** Claude's folder for this project; for over-long Windows paths, whichever hash spelling exists. */
+function defaultClaudeDirs(root) {
+  const c = claudeMemoryDirs(root);
+  if (c.length === 1) return c;
+  const found = c.filter((d) => isDir(d));
+  return found.length ? found : [c[0]];
+}
+
+/** Does a note mention this project's path (either separator, any case on Windows)? */
+export function mentionsPath(raw, root, win = IS_WIN) {
+  if (!win) return raw.includes(root);
+  const hay = raw.toLowerCase();
+  return [root, fwd(root)].some((v) => hay.includes(v.toLowerCase()));
+}
+
 /** Memory source dirs for a project: Claude default + config extras; Codex/Cursor extras. */
 export function sources(root) {
   const cfg = readConfig(root);
   return {
-    claude: [...new Set([claudeMemoryDir(root), ...cfg.claudeMemoryDirs])],
+    claude: uniquePaths([...defaultClaudeDirs(root), ...cfg.claudeMemoryDirs]),
     codex: cfg.codexMemoryDirs,
     cursor: cfg.cursorMemoryDirs,
     copy: cfg.copy,
@@ -435,7 +477,7 @@ export function sync(root) {
   for (const d of src.codex) changed.push(...copyNotes(d, memDir("codex"), literals, counts));
   // Codex's global memories folder: only manual notes that mention this project's path.
   const codexNotes = join(CODEX_DIR, "memories", "extensions", "ad_hoc", "notes");
-  changed.push(...copyNotes(codexNotes, memDir("codex"), literals, counts, (raw) => raw.includes(root)));
+  changed.push(...copyNotes(codexNotes, memDir("codex"), literals, counts, (raw) => mentionsPath(raw, root)));
   for (const d of src.cursor) changed.push(...copyNotes(d, memDir("cursor"), literals, counts));
   for (const c of src.copy) changed.push(...copyNotes(c.from, c.to, literals, counts));
   // Scrub notes written directly in the repo too (tools write there).
@@ -468,10 +510,11 @@ export function register(root, memDirs) {
     const reg = readJson(REGISTRY(), {}) || {};
     let dirty = false;
     for (const d of memDirs) {
-      const list = new Set(reg[d] ?? []);
-      if (!list.has(root)) {
+      const k = pathKey(d);
+      const list = new Set(reg[k] ?? []);
+      if (![...list].some((r) => samePath(r, root))) {
         list.add(root);
-        reg[d] = [...list].sort();
+        reg[k] = [...list].sort();
         dirty = true;
       }
     }
@@ -481,7 +524,7 @@ export function register(root, memDirs) {
 
 export function reposForMemoryDir(dir) {
   const reg = readJson(REGISTRY(), {}) || {};
-  return (reg[dir] ?? []).filter((r) => existsSync(r));
+  return (reg[pathKey(dir)] ?? []).filter((r) => existsSync(r));
 }
 
 // ---------- mode switching ----------
@@ -501,14 +544,14 @@ export function removeLocalArtifacts(root, log) {
   const cl = join(root, "CLAUDE.local.md");
   const t = readText(cl);
   if (t != null) {
-    const n = claudeLocalWithout(t);
+    const n = withEol(t, claudeLocalWithout(lf(t)));
     if (n === "") (unlinkSync(cl), log(`removed ${cl}`));
     else if (n !== t) (writeIfChanged(cl, n), log(`updated ${cl}`));
   }
   const ex = excludePath(root);
   const et = ex ? readText(ex) : null;
   if (et != null) {
-    const n = excludeWithout(et);
+    const n = withEol(et, excludeWithout(lf(et)));
     if (n !== et) (writeIfChanged(ex, n), log(`removed ai-memory-sync entries from ${ex}`));
   }
 }
@@ -517,16 +560,17 @@ export function removeLocalArtifacts(root, log) {
 export function removeGitArtifacts(root, log) {
   const warnings = [];
   const agents = join(root, "AGENTS.md");
-  const at = readText(agents);
+  const atRaw = readText(agents);
+  const at = lf(atRaw);
   if (at != null) {
     let n = removeBlock(at);
     if (n.includes(GIT_SECTION.trim())) n = n.replace(GIT_SECTION.trim(), "").replace(/\n{3,}/g, "\n\n").trim();
     n = n.trim() ? `${n.trim()}\n` : "";
     if (n === "" && !isTracked(root, "AGENTS.md")) (unlinkSync(agents), log("removed AGENTS.md (it only held generated content)"));
-    else if (n !== at) (writeIfChanged(agents, n), log("removed the generated block from AGENTS.md"));
+    else if (n !== at) (writeIfChanged(agents, withEol(atRaw, n)), log("removed the generated block from AGENTS.md"));
   }
   const claude = join(root, "CLAUDE.md");
-  const ct = readText(claude);
+  const ct = lf(readText(claude));
   if (ct != null && ct.trim() === "@AGENTS.md" && !isTracked(root, "CLAUDE.md")) (unlinkSync(claude), log("removed CLAUDE.md (only @AGENTS.md)"));
   else if (ct != null && /^@AGENTS\.md[ \t]*$/m.test(ct)) log("kept the @AGENTS.md import in CLAUDE.md (harmless; remove by hand if you want)");
   for (const rel of [CTX, MDC]) {

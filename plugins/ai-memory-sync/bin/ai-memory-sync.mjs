@@ -21,7 +21,23 @@ import {
   switchMode,
   sync,
 } from "../lib/project.mjs";
-import { HOME, claudeMemoryDir, git, gitRoot, hookAllowed, isDir, readStdin, readText } from "../lib/util.mjs";
+import {
+  HOME,
+  IS_WIN,
+  claudeMemoryDir,
+  claudeMemoryDirOf,
+  claudeMemoryDirs,
+  expandHome,
+  fwd,
+  git,
+  gitRoot,
+  hookAllowed,
+  isDir,
+  nativePath,
+  readStdin,
+  readText,
+  samePath,
+} from "../lib/util.mjs";
 
 const VERSION = JSON.parse(readFileSync(join(dirname(fileURLToPath(import.meta.url)), "..", ".claude-plugin", "plugin.json"), "utf8")).version;
 
@@ -56,7 +72,7 @@ const redactionSummary = (counts) => {
 };
 
 function projectRoot(p) {
-  const abs = resolve(p ?? ".");
+  const abs = resolve(nativePath(p ?? "."));
   return gitRoot(abs) ?? abs;
 }
 
@@ -156,7 +172,7 @@ async function cmdMode() {
 
 // ---------- scan ----------
 
-const SKIP_DIRS = new Set(["node_modules", ".git", "vendor", "dist", "build", ".next", "target", "Library", ".Trash"]);
+const SKIP_DIRS = new Set(["node_modules", ".git", "vendor", "dist", "build", ".next", "target", "Library", ".Trash", "AppData"]);
 
 function findRepos(root, depth) {
   const out = [];
@@ -190,7 +206,7 @@ const hasMd = (d) => {
 };
 
 function cmdScan() {
-  const root = resolve(opt("--root", join(HOME, "Developer")).replace(/^~(?=\/|$)/, HOME));
+  const root = resolve(nativePath(expandHome(opt("--root", join(HOME, "Developer")))));
   const depth = Number(opt("--depth", 5));
   const apply = flags.has("--apply");
   const all = flags.has("--all");
@@ -254,8 +270,6 @@ function cmdDoctor(p) {
 
 // ---------- hooks ----------
 
-const MEMORY_PATH = /^(.*\/\.claude\/projects\/[^/]+\/memory)(\/|$)/;
-
 function syncQuiet(root, withInit) {
   try {
     if (!hookAllowed(root)) return null;
@@ -271,7 +285,7 @@ function targetsFor(cwd) {
   const set = new Set();
   const root = gitRoot(cwd);
   if (root) set.add(root);
-  for (const r of reposForMemoryDir(claudeMemoryDir(cwd))) set.add(r);
+  for (const d of claudeMemoryDirs(cwd)) for (const r of reposForMemoryDir(d)) set.add(r);
   return { root, set };
 }
 
@@ -283,14 +297,14 @@ async function cmdHook(tool, event) {
     input = raw ? JSON.parse(raw) : {};
   } catch {}
   if (tool === "claude" || tool === "codex") {
-    const cwd = input.cwd || process.env.CLAUDE_PROJECT_DIR || process.cwd();
+    const cwd = nativePath(input.cwd || process.env.CLAUDE_PROJECT_DIR || process.cwd());
     if (event === "post-tool-use") {
       const fp = input.tool_input?.file_path || input.tool_response?.filePath || "";
-      const m = String(fp).match(MEMORY_PATH);
-      if (!m) return;
-      const set = new Set(reposForMemoryDir(m[1]));
+      const memDir = claudeMemoryDirOf(fp);
+      if (!memDir) return;
+      const set = new Set(reposForMemoryDir(memDir));
       const root = gitRoot(cwd);
-      if (root && sources(root).claude.includes(m[1])) set.add(root);
+      if (root && sources(root).claude.some((d) => samePath(d, memDir))) set.add(root);
       for (const r of set) syncQuiet(r, false);
       return;
     }
@@ -299,10 +313,10 @@ async function cmdHook(tool, event) {
     return; // stdout stays empty: SessionStart stdout would be injected into context
   }
   if (tool === "cursor") {
-    const roots = (input.workspace_roots?.length ? input.workspace_roots : [process.cwd()]).map((r) => resolve(r));
+    const roots = (input.workspace_roots?.length ? input.workspace_roots : [process.cwd()]).map((r) => resolve(nativePath(String(r))));
     const contexts = [];
     for (const wr of roots) {
-      if (event === "afterFileEdit" && !String(input.file_path ?? "").includes(`/${MEM}/`)) continue;
+      if (event === "afterFileEdit" && !fwd(input.file_path ?? "").includes(`/${MEM}/`)) continue;
       const { root, set } = targetsFor(wr);
       for (const r of set) {
         const res = syncQuiet(r, event === "sessionStart" && r === root);
@@ -317,6 +331,9 @@ async function cmdHook(tool, event) {
   }
 }
 
+/** Quote one argument for a cmd.exe command line. */
+const winArg = (a) => (/^[\w.:\\/=-]+$/.test(a) ? a : `"${String(a).replace(/"/g, '""')}"`);
+
 /** Codex legacy notify: argv = codex-notify -- <original notify argv...> <payload JSON>. */
 function cmdCodexNotify() {
   const rest = argv.slice(argv.indexOf("codex-notify") + 1);
@@ -329,13 +346,22 @@ function cmdCodexNotify() {
   const orig = rest.slice(dash >= 0 ? dash + 1 : 0, payload ? -1 : undefined);
   if (orig.length) {
     try {
-      const child = spawn(orig[0], [...orig.slice(1), ...(payload ? [payloadArg] : [])], { detached: true, stdio: "ignore" });
+      const args = [...orig.slice(1), ...(payload ? [payloadArg] : [])];
+      const opts = { detached: true, stdio: "ignore", windowsHide: true };
+      // Windows: .cmd/.bat cannot be spawned without a shell (Node refuses since the 2024 batch-file fix).
+      const child =
+        IS_WIN && /\.(cmd|bat)$/i.test(orig[0])
+          ? spawn(process.env.ComSpec || "cmd.exe", ["/d", "/s", "/c", `"${[orig[0], ...args].map(winArg).join(" ")}"`], {
+              ...opts,
+              windowsVerbatimArguments: true,
+            })
+          : spawn(orig[0], args, opts);
       child.on("error", () => {});
       child.unref();
     } catch {}
   }
   if (process.env.AI_MEMORY_SYNC === "0" || !payload?.cwd) return;
-  for (const r of targetsFor(payload.cwd).set) syncQuiet(r, true);
+  for (const r of targetsFor(nativePath(payload.cwd)).set) syncQuiet(r, true);
 }
 
 /** git post-checkout after a clone: local mode only, so no tracked file changes. */

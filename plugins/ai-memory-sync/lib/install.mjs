@@ -1,19 +1,23 @@
 // Global wiring for Claude Code, Codex, Cursor and git clones. Every edited file is backed up first.
 import { execFileSync, spawnSync } from "node:child_process";
 import { chmodSync, cpSync, existsSync, lstatSync, mkdirSync, readlinkSync, rmdirSync, rmSync, symlinkSync, unlinkSync } from "node:fs";
-import { dirname, join, resolve } from "node:path";
+import { delimiter, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   CLAUDE_DIR,
   CODEX_DIR,
   CURSOR_DIR,
   HOME,
+  IS_WIN,
   STATE_DIR,
   backup,
   expandHome,
+  fwd,
   isDir,
+  nativePath,
   readJson,
   readText,
+  samePath,
   which,
   writeIfChanged,
 } from "./util.mjs";
@@ -21,6 +25,11 @@ import {
 export const PLUGIN_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 export const APP_DIR = join(STATE_DIR, "app");
 export const SHIM = join(STATE_DIR, "bin", "ai-memory-sync");
+/** Windows: cmd.exe and PowerShell run this one (no .ps1, so no execution-policy prompts). */
+export const SHIM_CMD = `${SHIM}.cmd`;
+export const APP_CLI = join(APP_DIR, "bin", "ai-memory-sync.mjs");
+const APP_RUN_SH = join(APP_DIR, "bin", "run.sh");
+const SHIM_MARK = "ai-memory-sync shim (created by `ai-memory-sync install`)";
 const STATE = join(STATE_DIR, "state.json");
 const TEMPLATE_DIR = join(STATE_DIR, "git-template");
 const MARKETPLACE = "ai-memory-sync";
@@ -34,11 +43,41 @@ const MD_END = "<!-- END:ai-memory-sync -->";
 const q = (s) => (/[^A-Za-z0-9_./:-]/.test(s) ? `'${s.replace(/'/g, `'\\''`)}'` : s);
 const isOurs = (cmd) => typeof cmd === "string" && cmd.includes("ai-memory-sync");
 
+/**
+ * Command string for Codex/Cursor hooks. POSIX: the sh shim. Windows: `node "<C:/.../ai-memory-sync.mjs>" ...`,
+ * which parses the same in cmd.exe, PowerShell and Git Bash (forward slashes, one quoted path, bare `node`).
+ */
+export function hookCommand(args, win = IS_WIN, cli = APP_CLI) {
+  return win ? `node "${fwd(cli)}" ${args}` : `${q(SHIM)} ${args}`;
+}
+
+/** argv prefix for Codex's `notify` (run without a shell). Windows: absolute node.exe + the CLI script. */
+export function notifyPrefix(win = IS_WIN, node = process.execPath, cli = APP_CLI) {
+  return win ? [node, cli] : [SHIM];
+}
+
+/** Our notify chain inside a parsed `notify` array: { orig } (the chained command) or null. */
+function ourNotify(values) {
+  const i = values.indexOf("codex-notify");
+  if (i < 1 || !values.slice(0, i).some(isOurs)) return null;
+  const dash = values.indexOf("--", i);
+  return { prefix: values.slice(0, i), orig: dash >= 0 ? values.slice(dash + 1) : [] };
+}
+
+function cursorApp() {
+  if (process.platform === "darwin") return existsSync("/Applications/Cursor.app") ? "/Applications/Cursor.app" : null;
+  if (IS_WIN) {
+    const exe = process.env.LOCALAPPDATA && join(process.env.LOCALAPPDATA, "Programs", "cursor", "Cursor.exe");
+    return exe && existsSync(exe) ? exe : null;
+  }
+  return null;
+}
+
 export function detectTools() {
   return {
     claude: which("claude"),
     codex: which("codex") || (isDir(CODEX_DIR) ? CODEX_DIR : null),
-    cursor: which("cursor") || (existsSync("/Applications/Cursor.app") ? "/Applications/Cursor.app" : null) || (isDir(CURSOR_DIR) ? CURSOR_DIR : null),
+    cursor: which("cursor") || cursorApp() || (isDir(CURSOR_DIR) ? CURSOR_DIR : null),
     git: which("git"),
   };
 }
@@ -77,25 +116,22 @@ function findTopLevelNotify(text) {
 
 const tomlArray = (vals) => `notify = [${vals.map((v) => JSON.stringify(v)).join(", ")}]`;
 
-export function notifyWithChain(text) {
+export function notifyWithChain(text, prefix = notifyPrefix()) {
   const cur = findTopLevelNotify(text);
-  if (cur && cur.values[1] === "codex-notify" && isOurs(cur.values[0])) {
-    const orig = cur.values.slice(cur.values.indexOf("--") + 1);
-    const next = tomlArray([SHIM, "codex-notify", "--", ...orig]);
-    return text.slice(0, cur.start) + next + text.slice(cur.end);
-  }
-  const orig = cur ? cur.values : [];
-  const line = tomlArray([SHIM, "codex-notify", "--", ...orig]);
+  const ours = cur && ourNotify(cur.values);
+  const orig = ours ? ours.orig : cur ? cur.values : [];
+  const line = tomlArray([...prefix, "codex-notify", "--", ...orig]);
   if (cur) return text.slice(0, cur.start) + line + text.slice(cur.end);
-  return `${line}\n${text}`;
+  const nl = text.includes("\r\n") ? "\r\n" : "\n";
+  return `${line}${nl}${text}`;
 }
 
 export function notifyWithoutChain(text) {
   const cur = findTopLevelNotify(text);
-  if (!cur || cur.values[1] !== "codex-notify" || !isOurs(cur.values[0])) return text;
-  const orig = cur.values.slice(cur.values.indexOf("--") + 1);
-  if (orig.length) return text.slice(0, cur.start) + tomlArray(orig) + text.slice(cur.end);
-  return text.slice(0, cur.start) + text.slice(cur.end).replace(/^\n/, "");
+  const ours = cur && ourNotify(cur.values);
+  if (!ours) return text;
+  if (ours.orig.length) return text.slice(0, cur.start) + tomlArray(ours.orig) + text.slice(cur.end);
+  return text.slice(0, cur.start) + text.slice(cur.end).replace(/^\r?\n/, "");
 }
 
 // ---------- marker helpers ----------
@@ -147,20 +183,39 @@ const CODEX_AGENTS = `## Project memory (ai-memory-sync)
 
 Each project can keep shared AI memory in \`docs/ai-context/memory/\`. Save long-term notes about a project as \`.md\` files, one fact per file and never secrets, in \`docs/ai-context/memory/codex/\` at the project's root (create the folder if missing). The merged memory of every AI tool is the "Project memory" block in \`AGENTS.md\` (or \`AGENTS.override.md\` when the project uses local mode). It is rebuilt automatically after each turn, so do not edit the block by hand.`;
 
-const POST_CHECKOUT = () => `${SH_BEGIN} (scaffolds AI memory on the first checkout after a clone; skip with AI_MEMORY_SYNC=0)
+// Git for Windows runs hooks with its bundled sh, so the hook stays POSIX sh (LF endings) and calls
+// run.sh, which finds node.exe. POSIX keeps calling the executable shim.
+const POST_CHECKOUT = (win = IS_WIN) => {
+  const test = win ? `[ -f ${q(fwd(APP_RUN_SH))} ]` : `[ -x ${q(SHIM)} ]`;
+  const call = win ? `sh ${q(fwd(APP_RUN_SH))}` : q(SHIM);
+  return `${SH_BEGIN} (scaffolds AI memory on the first checkout after a clone; skip with AI_MEMORY_SYNC=0)
 case "$1" in *[!0]*) ;; *)
-  if [ "\${AI_MEMORY_SYNC:-1}" != "0" ] && [ -x ${q(SHIM)} ]; then
-    ${q(SHIM)} clone-hook "$(git rev-parse --show-toplevel)" || true
+  if [ "\${AI_MEMORY_SYNC:-1}" != "0" ] && ${test}; then
+    ${call} clone-hook "$(git rev-parse --show-toplevel)" || true
   fi ;;
 esac
 ${SH_END}`;
+};
 
 // ---------- install ----------
 
+const winArg = (a) => (/^[\w.:\\/@=-]+$/.test(a) ? a : `"${String(a).replace(/"/g, '""')}"`);
+
 function run(cmd, args) {
-  const r = spawnSync(cmd, args, { encoding: "utf8", timeout: 180000 });
+  const opts = { encoding: "utf8", timeout: 180000, windowsHide: true };
+  // Windows: npm-style .cmd shims (claude.cmd, codex.cmd) need cmd.exe; Node refuses to spawn them directly.
+  const r =
+    IS_WIN && /\.(cmd|bat)$/i.test(cmd)
+      ? spawnSync(process.env.ComSpec || "cmd.exe", ["/d", "/s", "/c", `"${[cmd, ...args].map(winArg).join(" ")}"`], {
+          ...opts,
+          windowsVerbatimArguments: true,
+        })
+      : spawnSync(cmd, args, opts);
   return { ok: r.status === 0, out: `${r.stdout ?? ""}${r.stderr ?? ""}`.trim() };
 }
+
+/** Value for `git config init.templateDir` read back as a native path. */
+const gitPath = (v) => (v ? resolve(nativePath(expandHome(v))) : null);
 
 function edit(file, transform, log, changes) {
   const before = readText(file);
@@ -182,10 +237,36 @@ export function installApp(log) {
     }
     log(`app copied to ${APP_DIR}`);
   }
-  const shim = `#!/bin/sh\n# ai-memory-sync shim (created by \`ai-memory-sync install\`)\nexec /bin/sh ${q(join(APP_DIR, "bin", "run.sh"))} "$@"\n`;
-  if (writeIfChanged(SHIM, shim)) log(`created: ${SHIM}`);
-  chmodSync(SHIM, 0o755);
+  for (const { path, content } of shimFiles()) {
+    if (writeIfChanged(path, content)) log(`created: ${path}`);
+    chmodSync(path, 0o755);
+  }
 }
+
+/** Escape for a batch file: % must be doubled. */
+const bat = (s) => s.replace(/%/g, "%%");
+
+/** The shims: sh everywhere (Git Bash on Windows too), plus a .cmd for cmd.exe and PowerShell on Windows. */
+export function shimFiles(win = IS_WIN, node = process.execPath) {
+  const sh = `#!/bin/sh\n# ${SHIM_MARK}\nexec /bin/sh ${q(win ? fwd(APP_RUN_SH) : APP_RUN_SH)} "$@"\n`;
+  const files = [{ path: SHIM, content: sh }];
+  if (win) {
+    const cmd = [
+      "@echo off",
+      `rem ${SHIM_MARK}`,
+      "setlocal",
+      `set "AMS_NODE=${bat(node)}"`,
+      'if not exist "%AMS_NODE%" set "AMS_NODE=node"',
+      `"%AMS_NODE%" "${bat(APP_CLI)}" %*`,
+      "exit /b %ERRORLEVEL%",
+      "",
+    ].join("\r\n");
+    files.push({ path: SHIM_CMD, content: cmd });
+  }
+  return files;
+}
+
+const onPath = (dir) => (process.env.PATH || "").split(delimiter).some((d) => d && samePath(d.replace(/^"(.*)"$/, "$1"), dir));
 
 export function install({ claudeSource = GH_REPO, log = console.log } = {}) {
   const tools = detectTools();
@@ -194,9 +275,21 @@ export function install({ claudeSource = GH_REPO, log = console.log } = {}) {
   const missing = [];
   installApp(log);
 
-  // PATH convenience link.
-  const link = join(HOME, ".local", "bin", "ai-memory-sync");
-  if (isDir(dirname(link)) && !existsSync(link)) {
+  // PATH convenience link. Windows: symlinks need admin or developer mode, so copy the .cmd shim
+  // (it holds absolute paths) into ~/.local/bin, where Claude Code's native installer puts claude.exe.
+  const linkDir = join(HOME, ".local", "bin");
+  const link = join(linkDir, IS_WIN ? "ai-memory-sync.cmd" : "ai-memory-sync");
+  if (IS_WIN) {
+    const cur = readText(link);
+    if (isDir(linkDir) && (cur == null || cur.includes(SHIM_MARK))) {
+      if (writeIfChanged(link, readText(SHIM_CMD))) log(`created: ${link}`);
+      state.link = link;
+    }
+    if (!onPath(dirname(SHIM)) && !(state.link && onPath(linkDir))) {
+      log(`PATH: add ${dirname(SHIM)} to your user PATH to run ai-memory-sync from any shell. PowerShell:`);
+      log(`  [Environment]::SetEnvironmentVariable('Path', [Environment]::GetEnvironmentVariable('Path','User') + ';${dirname(SHIM)}', 'User')`);
+    }
+  } else if (isDir(linkDir) && !existsSync(link)) {
     try {
       symlinkSync(SHIM, link);
       state.link = link;
@@ -259,7 +352,7 @@ export function install({ claudeSource = GH_REPO, log = console.log } = {}) {
       join(CODEX_DIR, "hooks.json"),
       (t) => {
         const j = t ? JSON.parse(t) : {};
-        const cmd = (ev) => ({ type: "command", command: `${q(SHIM)} hook codex ${ev}`, timeout: 30 });
+        const cmd = (ev) => ({ type: "command", command: hookCommand(`hook codex ${ev}`), timeout: 30 });
         return `${JSON.stringify(
           addHooks(j, {
             SessionStart: { matcher: "startup|resume|clear", hooks: [cmd("session-start")] },
@@ -282,7 +375,7 @@ export function install({ claudeSource = GH_REPO, log = console.log } = {}) {
       (t) => {
         const j = t ? JSON.parse(t) : { version: 1 };
         j.version ??= 1;
-        const cmd = (ev) => ({ command: `${q(SHIM)} hook cursor ${ev}`, timeout: 30 });
+        const cmd = (ev) => ({ command: hookCommand(`hook cursor ${ev}`), timeout: 30 });
         return `${JSON.stringify(addHooks(j, { sessionStart: cmd("sessionStart"), afterFileEdit: cmd("afterFileEdit"), stop: cmd("stop") }), null, 2)}\n`;
       },
       log,
@@ -293,15 +386,17 @@ export function install({ claudeSource = GH_REPO, log = console.log } = {}) {
   // git clones: init.templateDir with a post-checkout hook.
   if (tools.git) {
     const cur = run("git", ["config", "--global", "--get", "init.templateDir"]);
-    const existing = cur.ok && cur.out ? resolve(expandHome(cur.out)) : null;
+    const existing = cur.ok && cur.out ? gitPath(cur.out) : null;
     const tdir = existing || TEMPLATE_DIR;
     const hook = join(tdir, "hooks", "post-checkout");
     edit(
       hook,
       (t) => {
         if (t == null) return `#!/bin/sh\n${POST_CHECKOUT()}\nexit 0\n`;
-        const shebang = t.startsWith("#!") ? t.slice(0, t.indexOf("\n") + 1) : "";
-        const rest = withoutMarked(t.slice(shebang.length), SH_BEGIN, SH_END) ?? "";
+        // sh chokes on CR: hooks always get LF endings.
+        const u = t.replace(/\r\n/g, "\n");
+        const shebang = u.startsWith("#!") ? u.slice(0, u.indexOf("\n") + 1) : "";
+        const rest = withoutMarked(u.slice(shebang.length), SH_BEGIN, SH_END) ?? "";
         return `${shebang || "#!/bin/sh\n"}${POST_CHECKOUT()}\n${rest}`;
       },
       log,
@@ -310,10 +405,11 @@ export function install({ claudeSource = GH_REPO, log = console.log } = {}) {
     chmodSync(hook, 0o755);
     if (!existing) {
       backup(join(HOME, ".gitconfig"), log);
-      execFileSync("git", ["config", "--global", "init.templateDir", tdir]);
+      // Forward slashes on Windows: backslashes are escape characters in .gitconfig.
+      execFileSync("git", ["config", "--global", "init.templateDir", IS_WIN ? fwd(tdir) : tdir], { windowsHide: true });
       state.gitTemplateDirSet = tdir;
       log(`git: set global init.templateDir = ${tdir}`);
-    } else if (existing !== TEMPLATE_DIR) log(`git: merged post-checkout into existing init.templateDir ${existing}`);
+    } else if (!samePath(existing, TEMPLATE_DIR)) log(`git: merged post-checkout into existing init.templateDir ${existing}`);
   } else missing.push("git");
 
   state.changes = [...(state.changes ?? []), ...changes];
@@ -372,8 +468,8 @@ export function uninstall({ log = console.log } = {}) {
   }
   // git template
   const cur = run("git", ["config", "--global", "--get", "init.templateDir"]);
-  const tdir = cur.ok && cur.out ? resolve(expandHome(cur.out)) : null;
-  if (tdir && resolve(tdir) === resolve(TEMPLATE_DIR)) {
+  const tdir = cur.ok && cur.out ? gitPath(cur.out) : null;
+  if (tdir && samePath(tdir, TEMPLATE_DIR)) {
     backup(join(HOME, ".gitconfig"), log);
     run("git", ["config", "--global", "--unset", "init.templateDir"]);
     log("git: unset global init.templateDir");
@@ -383,13 +479,16 @@ export function uninstall({ log = console.log } = {}) {
     if (t != null) {
       const n = withoutMarked(t, SH_BEGIN, SH_END);
       const created = (state.changes ?? []).some((c) => c.file === hook && c.created);
-      if (created && /^#!\/bin\/sh\n(exit 0\n)?$/.test(n.trim() ? n.replace(/\n*$/, "\n") : "")) (backup(hook, log), unlinkSync(hook), log(`removed: ${hook}`));
+      if (created && /^#!\/bin\/sh\r?\n(exit 0\r?\n)?$/.test(n.trim() ? n.replace(/\n*$/, "\n") : "")) (backup(hook, log), unlinkSync(hook), log(`removed: ${hook}`));
       else edit(hook, () => n, log, changes);
     }
   }
   if (state.link) {
     try {
-      if (lstatSync(state.link).isSymbolicLink() && readlinkSync(state.link) === SHIM) (unlinkSync(state.link), log(`removed: ${state.link}`));
+      const st = lstatSync(state.link);
+      const linked = st.isSymbolicLink() && readlinkSync(state.link) === SHIM;
+      const copied = st.isFile() && (readText(state.link) ?? "").includes(SHIM_MARK);
+      if (linked || copied) (unlinkSync(state.link), log(`removed: ${state.link}`));
     } catch {}
   }
   for (const p of [APP_DIR, join(STATE_DIR, "bin"), TEMPLATE_DIR, STATE, join(STATE_DIR, "registry.json")]) {
@@ -410,6 +509,12 @@ export function doctorGlobal() {
   const ok = (b) => (b ? "ok " : "-- ");
   lines.push(`node ${process.version}${Number(process.versions.node.split(".")[0]) >= 20 ? "" : " (needs >= 20)"}`);
   lines.push(`${ok(existsSync(SHIM))}shim ${SHIM}`);
+  if (IS_WIN) {
+    lines.push(`${ok(existsSync(SHIM_CMD))}shim ${SHIM_CMD}`);
+    const node = which("node", { extra: false });
+    lines.push(`${ok(node)}node on PATH${node ? ` (${node})` : ": Codex and Cursor hooks run \`node\`; add Node.js to PATH"}`);
+    if (/[%$`]/.test(APP_CLI)) lines.push(`-- install path ${APP_CLI} has % $ or \`, which shells expand; set AI_MEMORY_SYNC_DIR to a plain path`);
+  }
   const installed = readJson(join(CLAUDE_DIR, "plugins", "installed_plugins.json"), {}) || {};
   const claudePlugin = JSON.stringify(installed).includes(PLUGIN_ID);
   const settings = readJson(join(CLAUDE_DIR, "settings.json"), {}) || {};
@@ -421,13 +526,18 @@ export function doctorGlobal() {
   if (tools.codex) {
     const cfg = readText(join(CODEX_DIR, "config.toml")) ?? "";
     const n = findTopLevelNotify(cfg);
-    lines.push(`${ok(n?.values[1] === "codex-notify")}codex: notify chain${n?.values[1] === "codex-notify" ? ` (chained: ${n.values.slice(3).length ? "yes" : "none"})` : " missing"}`);
+    const ours = n && ourNotify(n.values);
+    const exe = ours?.prefix[0];
+    const exeOk = Boolean(exe) && existsSync(exe);
+    lines.push(
+      `${ok(ours && exeOk)}codex: notify chain${ours ? ` (chained: ${ours.orig.length ? "yes" : "none"})${exeOk ? "" : `; ${exe} not found, run install again`}` : " missing"}`,
+    );
     lines.push(`${ok((readText(join(CODEX_DIR, "hooks.json")) ?? "").includes("ai-memory-sync"))}codex: ~/.codex/hooks.json (approve once in Codex with /hooks)`);
     lines.push(`${ok((readText(join(CODEX_DIR, "AGENTS.md")) ?? "").includes(MD_BEGIN))}codex: ~/.codex/AGENTS.md note`);
   } else lines.push("-- codex: not found");
   lines.push(tools.cursor ? `${ok((readText(join(CURSOR_DIR, "hooks.json")) ?? "").includes("ai-memory-sync"))}cursor: ~/.cursor/hooks.json` : "-- cursor: not found");
   const t = run("git", ["config", "--global", "--get", "init.templateDir"]);
-  const tdir = t.ok && t.out ? resolve(expandHome(t.out)) : null;
+  const tdir = t.ok && t.out ? gitPath(t.out) : null;
   lines.push(`${ok(tdir && (readText(join(tdir, "hooks", "post-checkout")) ?? "").includes(SH_BEGIN))}git: init.templateDir ${tdir ?? "(unset)"}`);
   return lines;
 }

@@ -2,11 +2,13 @@
 // Fake credentials are assembled at runtime so no secret-looking literal lives in this file.
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync, existsSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 
-const sandbox = mkdtempSync(join(tmpdir(), "ams-test-"));
+// realpath.native expands Windows 8.3 names (C:\Users\RUNNER~1), so git and node agree on paths.
+const sandbox = mkdtempSync(join(realpathSync.native(tmpdir()), "ams-test-"));
 const fakeHome = join(sandbox, "home");
 mkdirSync(fakeHome, { recursive: true });
 process.env.AI_MEMORY_SYNC_HOME_OVERRIDE = fakeHome;
@@ -18,7 +20,8 @@ delete process.env.AI_MEMORY_SYNC;
 const { scrub, envLiterals } = await import("../plugins/ai-memory-sync/lib/scrub.mjs");
 const P = await import("../plugins/ai-memory-sync/lib/project.mjs");
 const I = await import("../plugins/ai-memory-sync/lib/install.mjs");
-const { claudeSlug } = await import("../plugins/ai-memory-sync/lib/util.mjs");
+const U = await import("../plugins/ai-memory-sync/lib/util.mjs");
+const { claudeSlug } = U;
 
 let passed = 0;
 const t = (name, fn) => {
@@ -123,9 +126,84 @@ t("removeBlock leaves the rest", () => {
   assert.equal(P.removeBlock(text), `${NEXT_BLOCK}\n`);
 });
 
-t("claude slug maps every non-alphanumeric char to -", () => {
-  assert.equal(claudeSlug("/Users/leul/Developer/CRM + Manychat"), "-Users-leul-Developer-CRM---Manychat");
-  assert.equal(claudeSlug("/Users/leul/Developer/Higgsfield"), "-Users-leul-Developer-Higgsfield");
+t("claude slug maps every non-alphanumeric char to - (POSIX)", () => {
+  assert.equal(claudeSlug("/Users/me/Developer/CRM + App", false), "-Users-me-Developer-CRM---App");
+  assert.equal(claudeSlug("/home/me/src/my_app.v2", false), "-home-me-src-my-app-v2");
+});
+
+t("claude slug for Windows paths (path.win32)", () => {
+  assert.equal(claudeSlug("C:\\Users\\me\\proj", true), "C--Users-me-proj");
+  assert.equal(claudeSlug("C:/Users/me/proj", true), "C--Users-me-proj");
+  assert.equal(claudeSlug("c:\\Users\\me\\My App", true), "C--Users-me-My-App");
+  assert.equal(claudeSlug("/c/Users/me/proj", true), "C--Users-me-proj", "Git Bash spelling");
+  assert.equal(claudeSlug("D:\\work\\a.b-c", true), "D--work-a-b-c");
+});
+
+t("claude slug truncates over 200 chars with a hash, like Claude Code", () => {
+  const long = "/Users/me/" + "x".repeat(250);
+  const s = claudeSlug(long, false);
+  assert.ok(s.startsWith("-Users-me-xxx"));
+  assert.match(s, /^.{200}-[0-9a-z]+$/);
+  assert.notEqual(s, claudeSlug(long + "y", false));
+  let h = 0; // Java-style 32-bit hash of the full path, base 36
+  for (const c of long) h = ((h << 5) - h + c.charCodeAt(0)) | 0;
+  assert.equal(s.slice(201), Math.abs(h).toString(36));
+  assert.equal(U.claudeSlugs("C:\\Users\\me\\" + "y".repeat(250), true).length, 2, "both separator spellings are candidates");
+  assert.deepEqual(U.claudeSlugs("C:\\short", true), ["C--short"]);
+});
+
+t("nativePath / samePath / isInside on Windows-style paths", () => {
+  assert.equal(U.nativePath("/c/Users/me/x", true), "C:\\Users\\me\\x");
+  assert.equal(U.nativePath("/c:/Users/me/x", true), "C:\\Users\\me\\x");
+  assert.equal(U.nativePath("/cygdrive/d/w", true), "D:\\w");
+  assert.equal(U.nativePath("c:/a/b", true), "C:\\a\\b");
+  assert.equal(U.nativePath("/c/x", false), "/c/x", "identity on POSIX");
+  assert.ok(U.samePath("C:\\Users\\Me\\Proj", "c:/users/me/proj", true));
+  assert.ok(!U.samePath("/Users/Me", "/users/me", false));
+  assert.ok(U.isInside("C:\\Users\\me\\AppData\\Local\\Temp\\x", "c:\\users\\me\\appdata\\local\\temp", true));
+  assert.ok(!U.isInside("C:\\Users\\me\\TempX", "C:\\Users\\me\\Temp", true));
+  assert.equal(U.pathKey("C:\\A\\b", true), U.pathKey("c:/a/B", true));
+});
+
+t("claudeMemoryDirOf accepts either separator", () => {
+  const want = "C:\\Users\\me\\.claude\\projects\\C--Users-me-p\\memory";
+  assert.equal(U.claudeMemoryDirOf("C:\\Users\\me\\.claude\\projects\\C--Users-me-p\\memory\\note.md", true), want);
+  assert.equal(U.claudeMemoryDirOf("C:/Users/me/.claude/projects/C--Users-me-p/memory/n.md", true), want);
+  assert.equal(U.claudeMemoryDirOf("/Users/me/.claude/projects/-Users-me-p/memory/n.md", false), "/Users/me/.claude/projects/-Users-me-p/memory");
+  assert.equal(U.claudeMemoryDirOf("/Users/me/project/memory/n.md", false), null);
+});
+
+t("CRLF files keep their line endings", () => {
+  assert.equal(U.withEol("a\r\nb\r\n", "a\nb\nc\n"), "a\r\nb\r\nc\r\n");
+  assert.equal(U.withEol("a\nb\n", "x\n"), "x\n");
+  assert.equal(U.withEol(null, "x\n"), "x\n");
+});
+
+t("Windows hook commands: node + quoted forward-slash path; notify runs node.exe directly", () => {
+  const cli = "C:\\Users\\John Smith\\.ai-memory-sync\\app\\bin\\ai-memory-sync.mjs";
+  assert.equal(I.hookCommand("hook codex stop", true, cli), 'node "C:/Users/John Smith/.ai-memory-sync/app/bin/ai-memory-sync.mjs" hook codex stop');
+  assert.ok(!I.hookCommand("hook codex stop", false).startsWith("node "), "POSIX keeps the shim");
+  const node = "C:\\Program Files\\nodejs\\node.exe";
+  const orig = 'notify = ["C:\\\\tools\\\\n.exe", "x"]\r\nmodel = "m"\r\n';
+  const chained = I.notifyWithChain(orig, I.notifyPrefix(true, node, cli));
+  assert.ok(chained.startsWith(`notify = [${JSON.stringify(node)}, ${JSON.stringify(cli)}, "codex-notify", "--", "C:\\\\tools\\\\n.exe", "x"]`));
+  assert.equal(I.notifyWithoutChain(chained), orig);
+  // switching prefix (POSIX shim <-> Windows node) keeps the original command exactly once
+  assert.ok(I.notifyWithChain(chained, ["/x/shim"]).startsWith('notify = ["/x/shim", "codex-notify", "--", "C:'));
+});
+
+t("Windows shims: .cmd with CRLF, sh shim with forward slashes", () => {
+  const files = I.shimFiles(true, "C:\\Program Files\\nodejs\\node.exe");
+  const cmd = files.find((f) => f.path.endsWith(".cmd"));
+  assert.ok(cmd && cmd.content.includes("\r\n") && cmd.content.includes("%*"));
+  assert.ok(cmd.content.includes('set "AMS_NODE=C:\\Program Files\\nodejs\\node.exe"'));
+  assert.ok(!files[0].content.split("\n")[2].includes("\\"), "sh shim has no backslashes");
+  assert.equal(I.shimFiles(false).length, 1);
+});
+
+t("shell scripts in the repo use LF (sh fails on CR)", () => {
+  const runSh = readFileSync(fileURLToPath(new URL("../plugins/ai-memory-sync/bin/run.sh", import.meta.url)), "utf8");
+  assert.ok(!runSh.includes("\r"));
 });
 
 // ---------- modes (real git repos in the sandbox) ----------
@@ -218,12 +296,42 @@ t("off mode does nothing", () => {
 
 t("codex notify chain round-trips", () => {
   const orig = 'notify = ["/x/y z/app", "turn-ended"]\nmodel = "m"\n\n[t]\nnotify = "not top-level"\n';
-  const chained = I.notifyWithChain(orig);
-  assert.ok(chained.includes('"codex-notify", "--", "/x/y z/app", "turn-ended"'));
+  const chained = I.notifyWithChain(orig, I.notifyPrefix(false));
+  assert.ok(chained.startsWith(`notify = [${JSON.stringify(I.SHIM)}, "codex-notify", "--", "/x/y z/app", "turn-ended"]`));
   assert.equal(I.notifyWithChain(chained), chained);
   assert.equal(I.notifyWithoutChain(chained), orig);
   assert.equal(I.notifyWithoutChain(I.notifyWithChain('model = "m"\n')), 'model = "m"\n');
 });
 
-rmSync(sandbox, { recursive: true, force: true });
+t("CRLF AGENTS.md (core.autocrlf) stays CRLF in git mode and the block is idempotent", () => {
+  const { r } = mkRepo("crlf-repo");
+  writeFileSync(join(r, "AGENTS.md"), "# Team rules\r\n\r\nBe nice.\r\n");
+  writeFileSync(join(r, "CLAUDE.md"), "# Claude\r\n@AGENTS.md\r\n");
+  P.switchMode(r, "git", () => {});
+  const a = readFileSync(join(r, "AGENTS.md"), "utf8");
+  assert.ok(a.includes(P.BEGIN) && !/[^\r]\n/.test(a), "all line endings CRLF");
+  assert.equal(readFileSync(join(r, "CLAUDE.md"), "utf8"), "# Claude\r\n@AGENTS.md\r\n", "existing CRLF import detected");
+  assert.deepEqual(P.sync(r).changed, []);
+});
+
+t("symlink checked out as a text file (core.symlinks=false) is not overwritten", () => {
+  const { r } = mkRepo("symlink-text-repo");
+  // record CLAUDE.md as a symlink to AGENTS.md in the index, then check it out as plain text
+  const blob = execFileSync("git", ["-C", r, "hash-object", "-w", "--stdin"], { input: "AGENTS.md" }).toString().trim();
+  gitc(r, "update-index", "--add", "--cacheinfo", `120000,${blob},CLAUDE.md`);
+  gitc(r, "commit", "-q", "-m", "link");
+  writeFileSync(join(r, "CLAUDE.md"), "AGENTS.md");
+  P.switchMode(r, "git", () => {});
+  assert.equal(readFileSync(join(r, "CLAUDE.md"), "utf8"), "AGENTS.md");
+  assert.ok(readFileSync(join(r, "AGENTS.md"), "utf8").includes(P.BEGIN));
+});
+
+t("Codex global notes match the project path with either separator", () => {
+  assert.ok(P.mentionsPath("see C:/Users/me/Proj for x", "C:\\Users\\me\\proj", true));
+  assert.ok(!P.mentionsPath("see /Users/me/Proj", "/Users/me/proj", false));
+});
+
+try {
+  rmSync(sandbox, { recursive: true, force: true });
+} catch {} // Windows: a file can stay locked for a moment
 console.log(`${passed} tests passed${process.exitCode ? ", some FAILED" : ""}`);

@@ -7,7 +7,7 @@
       "name": "ai-memory-sync",
       "source": "./plugins/ai-memory-sync",
       "description": "Syncs Claude Code project memory into docs/ai-context/memory and rebuilds the shared memory block on session start, memory writes and stop.",
-      "version": "0.1.0"
+      "version": "0.1.1"
     }
   ]
 }

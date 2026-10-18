@@ -192,6 +192,23 @@ t("git mode: block in AGENTS.md, CLAUDE.md imports it, Next.js block kept; back 
   assert.equal(gitc(r, "ls-files", "--", P.CTX), "");
 });
 
+t("local mode in a worktree never edits the exclude shared with a git-mode worktree", () => {
+  const { r } = mkRepo("wt-main");
+  gitc(r, "branch", "old");
+  P.switchMode(r, "git", () => {});
+  gitc(r, "add", "-A");
+  gitc(r, "commit", "-q", "-m", "memory");
+  assert.throws(() => gitc(r, "config", "--local", "--get", "ai-memory-sync.mode"), "git mode must not live in .git/config");
+  const wt = join(sandbox, "wt-old");
+  gitc(r, "worktree", "add", "-q", wt, "old");
+  const res = P.init(wt);
+  assert.equal(res.mode, "local");
+  assert.ok(res.warnings.some((w) => w.includes("shared .git/info/exclude")));
+  const ex = P.excludePath(r);
+  assert.ok(!existsSync(ex) || !readFileSync(ex, "utf8").includes("ai-memory-sync"));
+  assert.equal(P.resolveMode(r).mode, "git");
+});
+
 t("off mode does nothing", () => {
   const { r } = mkRepo("off-repo");
   gitc(r, "config", "ai-memory-sync.mode", "off");

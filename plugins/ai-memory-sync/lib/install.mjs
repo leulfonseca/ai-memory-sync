@@ -216,6 +216,12 @@ export function install({ claudeSource = GH_REPO, log = console.log } = {}) {
       if (!r.ok) log(`claude plugin marketplace add failed: ${r.out.split("\n").pop()}`);
       else state.claude.addedMarketplace = true;
     }
+    if (ok && hadMarketplace) {
+      // Re-run: refresh the marketplace clone so a newer plugin version is picked up.
+      run(tools.claude, ["plugin", "marketplace", "update", MARKETPLACE]);
+      const u = run(tools.claude, ["plugin", "update", PLUGIN_ID, "--scope", "user"]);
+      if (u.ok) log(`claude: plugin ${PLUGIN_ID} up to date`);
+    }
     if (ok) {
       const r = run(tools.claude, ["plugin", "install", PLUGIN_ID, "--scope", "user"]);
       if (r.ok) {

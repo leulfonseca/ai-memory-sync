@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: ${{ matrix.os }} / node ${{ matrix.node }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        node: [20, 22]
+    steps:
+      - name: Keep Windows checkout line endings as in the repo
+        if: runner.os == 'Windows'
+        run: git config --global core.autocrlf true
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+      - name: Git identity for test repos
+        run: |
+          git config --global user.name ci
+          git config --global user.email ci@example.invalid
+      - name: Unit tests
+        run: node test/run.mjs
+      - name: Install / doctor / hooks / uninstall smoke test (fake HOME and USERPROFILE)
+        run: node test/smoke.mjs
+      - name: CLI help from PowerShell and cmd
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          node plugins/ai-memory-sync/bin/ai-memory-sync.mjs version
+          cmd /c "node plugins\ai-memory-sync\bin\ai-memory-sync.mjs version"

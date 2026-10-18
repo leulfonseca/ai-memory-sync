@@ -59,11 +59,11 @@ Long-term memory shared by AI coding assistants (Claude Code, Codex, Cursor), ke
 - \`memory/shared/\`: project facts every tool should know.
 - \`memory/claude/\`, \`memory/codex/\`, \`memory/cursor/\`: notes from each tool. Claude Code's local project memory is copied into \`memory/claude/\` automatically.
 
-\`ai-memory-sync sync\` merges every note into a generated "Project memory" block, with sensitive data scrubbed. In **git** mode the block lives in \`AGENTS.md\` and these files are committed with the project. In **local** mode (the default) the block goes to untracked files (\`AGENTS.local.md\`, \`CLAUDE.local.md\`, \`AGENTS.override.md\`, \`.cursor/rules/ai-memory.mdc\`) and this folder is listed in \`.git/info/exclude\`. Run \`ai-memory-sync mode\` to see the current mode.
+\`ai-memory-sync sync\` builds a generated "Project memory" block from the notes, with sensitive data scrubbed: behavior rules (\`type: feedback\` or \`user\`) and notes with \`pin: true\` in full, every other note as one index line that links to its file. In **git** mode the block lives in \`AGENTS.md\` and these files are committed with the project. In **local** mode (the default) the block goes to untracked files (\`AGENTS.local.md\`, \`CLAUDE.local.md\`, \`AGENTS.override.md\`, \`.cursor/rules/ai-memory.mdc\`) and this folder is listed in \`.git/info/exclude\`. Run \`ai-memory-sync mode\` to see the current mode.
 `,
   [MEM]: `# Memories per AI tool
 
-One fact per \`.md\` file. Optional YAML frontmatter with \`name\` and \`description\`. Never put secrets here (keys, passwords, tokens, personal data); the scrubber is a safety net, not a vault.
+One fact per \`.md\` file. Optional YAML frontmatter with \`name\`, \`description\` (shown in the index), \`type\` (\`feedback\`/\`user\` notes are inlined as rules) and \`pin: true\` (always inlined). Never put secrets here (keys, passwords, tokens, personal data); the scrubber is a safety net, not a vault.
 
 | Folder | Tool | Source |
 |---|---|---|
@@ -104,6 +104,7 @@ export function readConfig(root) {
     codexMemoryDirs: list("codexMemoryDirs"),
     cursorMemoryDirs: list("cursorMemoryDirs"),
     envAllowKeys: Array.isArray(c.envAllowKeys) ? c.envAllowKeys.map(String) : [],
+    block: BLOCK_MODES.includes(c.block) ? c.block : DEFAULT_BLOCK,
     copy: (Array.isArray(c.copy) ? c.copy : [])
       .filter((x) => x && x.from && x.to)
       .map((x) => ({ from: resolve(root, expandHome(x.from)), to: resolve(root, x.to) })),
@@ -150,18 +151,46 @@ function resolveModeNoGitConfig(root) {
 
 // ---------- notes and block ----------
 
-/** Body of a memory note without YAML frontmatter, plus name/description. */
+const unquote = (v) => v.replace(/^(["'])(.*)\1$/, "$2");
+/** Display text of a scalar: quotes removed and YAML escapes resolved (`\"` in "...", `''` in '...'). */
+const plainScalar = (v) => {
+  const s = v.trim();
+  if (/^".*"$/.test(s)) return s.slice(1, -1).replace(/\\(["\\])/g, "$1");
+  if (/^'.*'$/.test(s)) return s.slice(1, -1).replace(/''/g, "'");
+  return s;
+};
+const flag = (v) => (v == null ? null : /^(true|yes|on)$/i.test(plainScalar(v)) ? true : /^(false|no|off)$/i.test(plainScalar(v)) ? false : null);
+
+/**
+ * Body of a memory note without YAML frontmatter, plus name/description. `type` comes from `type:` or
+ * `metadata.type:` (Claude Code nests it); `pin` is true/false from `pin:` (or `metadata.pin:`), else null.
+ */
 export function parseNote(raw, file) {
   const text = raw.replace(/\r\n/g, "\n");
   const fm = text.match(/^---\n([\s\S]*?)\n---[ \t]*\n?/);
   const meta = {};
+  const rawMeta = {};
+  const nested = {};
+  let parent = null;
   for (const line of (fm?.[1] ?? "").split("\n")) {
     const m = line.match(/^([A-Za-z_][\w-]*):\s*(.*)$/);
-    if (m) meta[m[1]] = m[2].replace(/^(["'])(.*)\1$/, "$2");
+    if (m) {
+      meta[m[1]] = unquote(m[2]);
+      rawMeta[m[1]] = m[2];
+      parent = m[2].trim() === "" ? m[1] : null;
+      continue;
+    }
+    const n = parent && line.match(/^[ \t]+([A-Za-z_][\w-]*):\s*(.*)$/);
+    if (n) (nested[parent] ??= {})[n[1]] = n[2];
   }
+  const sub = nested.metadata ?? {};
+  const type = plainScalar(rawMeta.type ?? sub.type ?? "").toLowerCase();
   return {
     name: meta.name || basename(file).replace(/\.md$/, ""),
     description: meta.description || "",
+    summary: rawMeta.description ? plainScalar(rawMeta.description) : "",
+    type,
+    pin: flag(rawMeta.pin ?? sub.pin),
     body: text.slice(fm ? fm[0].length : 0).trim(),
   };
 }
@@ -187,25 +216,94 @@ const mdFiles = (dir) => {
 const neutralizeMarkers = (s) =>
   s.replaceAll(BEGIN_PREFIX, "&lt;!-- BEGIN:ai-memory").replaceAll(END, "&lt;!-- END:ai-memory -->");
 
-/** Build the generated block (markers included) from docs/ai-context/memory. */
-export function buildBlock(root) {
-  let out = "";
-  let n = 0;
+/** How the block renders notes: see README "Block size". */
+export const BLOCK_MODES = ["hybrid", "index", "full"];
+export const DEFAULT_BLOCK = "hybrid";
+/** Note types inlined in full in hybrid mode: behavior rules. */
+export const RULE_TYPES = ["feedback", "user"];
+/** Above this many bytes, `doctor` warns that the block is heavy for every session. */
+export const BLOCK_WARN_BYTES = 8192;
+
+const INTRO = "Long-term notes from every AI tool working on this repo. Source files: `docs/ai-context/memory/`.";
+const INDEX_HINT =
+  "Rules are inlined below and always apply. Every other note is one index line: when a task touches its topic, open the linked file first. The note files are the source of truth.";
+
+/** Notes in docs/ai-context/memory, in block order (section, then file name). */
+function readNotes(root) {
+  const list = [];
   for (const [dir, title] of SECTIONS) {
     const d = join(root, MEM, dir);
-    const files = mdFiles(d).filter((f) => !SKIP_NOTES.has(f));
-    if (!files.length) continue;
-    out += `\n### ${title}\n`;
-    for (const f of files) {
-      const note = parseNote(readText(join(d, f)) ?? "", f);
-      const body = neutralizeMarkers(note.body.replace(/^#{1,4} /gm, "##### "));
-      out += `\n#### ${note.name}${note.description ? ` (${note.description})` : ""}\n\n${body}\n`;
-      n++;
+    for (const f of mdFiles(d).filter((x) => !SKIP_NOTES.has(x))) list.push({ dir, title, file: f, ...parseNote(readText(join(d, f)) ?? "", f) });
+  }
+  return list;
+}
+
+const noteBody = (note) => neutralizeMarkers(note.body.replace(/^#{1,4} /gm, "##### "));
+
+/** v0.2 layout: every note in full, grouped by source. Kept byte-for-byte. */
+function renderFull(notes) {
+  let out = "";
+  let section = null;
+  for (const note of notes) {
+    if (note.title !== section) out += `\n### ${(section = note.title)}\n`;
+    out += `\n#### ${note.name}${note.description ? ` (${note.description})` : ""}\n\n${noteBody(note)}\n`;
+  }
+  return out;
+}
+
+/** Does `note` go into the block in full under `block` mode? `pin` wins over the type. */
+export function isInlined(note, block = DEFAULT_BLOCK) {
+  if (block === "full") return true;
+  if (note.pin != null) return note.pin;
+  return block === "hybrid" && RULE_TYPES.includes(note.type);
+}
+
+const oneLine = (s) => neutralizeMarkers(s.replace(/\s+/g, " ").trim());
+
+/** Index text: the description, else the note's first heading or line (cut at 120 chars). */
+function indexSummary(note) {
+  if (note.summary) return oneLine(note.summary);
+  const first = note.body.split("\n").find((l) => l.trim()) ?? "";
+  const t = oneLine(first.replace(/^#{1,6}\s+/, ""));
+  return t.length > 120 ? `${t.slice(0, 119).trimEnd()}…` : t;
+}
+
+function renderHybrid(notes, block) {
+  const rules = notes.filter((x) => isInlined(x, block));
+  const index = notes.filter((x) => !isInlined(x, block));
+  let out = `\n${INDEX_HINT}\n`;
+  if (rules.length) {
+    out += "\n### Rules\n";
+    for (const note of rules) {
+      const body = noteBody(note);
+      out += `\n#### ${oneLine(note.name)}${note.summary ? ` (${oneLine(note.summary)})` : ""}\n${body ? `\n${body}\n` : ""}`;
     }
   }
-  if (!n) out = "\n_No notes yet._\n";
-  const block = `${BEGIN}\n\n## Project memory\n\nLong-term notes from every AI tool working on this repo. Source files: \`docs/ai-context/memory/\`.\n${out}\n${END}`;
-  return { block: scrub(block, envLiterals(root, readConfig(root).envAllowKeys)).text, notes: n };
+  if (index.length) {
+    out += "\n### Index\n\n";
+    for (const note of index) {
+      const text = indexSummary(note);
+      out += `- **${oneLine(note.name)}**${text ? `: ${text}` : ""} → \`${MEM}/${note.dir}/${note.file}\`\n`;
+    }
+  }
+  return { out, inlined: rules.length, indexed: index.length };
+}
+
+/** Block mode for a project: explicit override, else `"block"` in .ai-memory-sync.json, else hybrid. */
+export const blockMode = (root, override) => override ?? readConfig(root).block;
+
+/** Build the generated block (markers included) from docs/ai-context/memory. */
+export function buildBlock(root, { block } = {}) {
+  const mode = blockMode(root, block);
+  const notes = readNotes(root);
+  let out;
+  let inlined = notes.length;
+  let indexed = 0;
+  if (!notes.length) out = "\n_No notes yet._\n";
+  else if (mode === "full") out = renderFull(notes);
+  else ({ out, inlined, indexed } = renderHybrid(notes, mode));
+  const text = `${BEGIN}\n\n## Project memory\n\n${INTRO}\n${out}\n${END}`;
+  return { block: scrub(text, envLiterals(root, readConfig(root).envAllowKeys)).text, notes: notes.length, inlined, indexed, mode };
 }
 
 /** Replace (or append) the generated block inside `text`. Everything outside the markers is preserved. */
@@ -323,10 +421,11 @@ function excludeWithout(text) {
  * Desired generated files for `mode`. Returns [{ path, content }] (content null = leave alone) and warnings.
  * Never includes tracked AGENTS.md/CLAUDE.md in local mode.
  */
-export function plan(root, mode) {
+export function plan(root, mode, opts = {}) {
   const out = [];
   const warnings = [];
-  const { block, notes } = buildBlock(root);
+  const built = buildBlock(root, opts);
+  const { block, notes } = built;
   const P = (rel) => join(root, rel);
   // Tracked files may be checked out with CRLF (core.autocrlf on Windows): edit as LF, write back
   // with the file's own line endings.
@@ -383,7 +482,11 @@ export function plan(root, mode) {
       out.push({ path: ex, content: withEol(et, excludeWith(lf(et), entries)) });
     }
   }
-  return { files: out, warnings, notes, block };
+  const rawBlock = readConfig(root).raw.block;
+  if (rawBlock != null && !BLOCK_MODES.includes(rawBlock)) {
+    warnings.push(`${CONFIG_FILE}: unknown "block" ${JSON.stringify(rawBlock)}; using ${DEFAULT_BLOCK} (one of ${BLOCK_MODES.join(", ")}).`);
+  }
+  return { files: out, warnings, notes, block, built };
 }
 
 // ---------- scaffold / sync ----------
@@ -401,21 +504,21 @@ export function scaffold(root) {
   return changed;
 }
 
-export function applyPlan(root, mode) {
-  const p = plan(root, mode);
+export function applyPlan(root, mode, opts = {}) {
+  const p = plan(root, mode, opts);
   const changed = [];
   for (const f of p.files) if (f.content != null && writeIfChanged(f.path, f.content)) changed.push(relative(root, f.path) || f.path);
   return { changed, warnings: p.warnings, notes: p.notes };
 }
 
 /** Scaffold the folders and generated files. Idempotent. */
-export function init(root, { mode } = {}) {
+export function init(root, { mode, block } = {}) {
   root = resolve(root);
   const resolved = mode ? { mode, source: "argument" } : resolveMode(root);
   if (resolved.mode === "off") return { root, mode: "off", changed: [], warnings: [] };
   if (resolved.source === "default" || mode) setGitConfigMode(root, resolved.mode);
   const changed = scaffold(root);
-  const r = applyPlan(root, resolved.mode);
+  const r = applyPlan(root, resolved.mode, { block });
   return { root, mode: resolved.mode, changed: [...changed, ...r.changed], warnings: r.warnings };
 }
 
@@ -464,7 +567,7 @@ export function sources(root) {
   };
 }
 
-export function sync(root) {
+export function sync(root, { block } = {}) {
   root = resolve(root);
   const { mode } = resolveMode(root);
   if (mode === "off") return { root, mode, changed: [], counts: {}, warnings: [] };
@@ -489,7 +592,7 @@ export function sync(root) {
       if (writeIfChanged(p, s.text)) changed.push(p);
     }
   }
-  const r = applyPlan(root, mode);
+  const r = applyPlan(root, mode, { block });
   register(root, src.claude);
   return {
     root,

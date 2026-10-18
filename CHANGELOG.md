@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.3.0
+
+Smaller memory block. Every tool loads it at the start of every session, and in 0.2 it held the full text of every note.
+
+- New `"block"` setting in `.ai-memory-sync.json`: `hybrid` (default), `index` or `full`.
+  - `hybrid` inlines behavior rules (notes with `type: feedback` or `type: user`, at the top level or under `metadata:`) and pinned notes. Every other note becomes one index line: `- **name**: description → \`docs/ai-context/memory/<tool>/<file>.md\``.
+  - `index` inlines pinned notes only. `full` is the 0.2 output, byte for byte.
+- Frontmatter `pin: true` always inlines a note; `pin: false` keeps a rule in the index.
+- Index lines without a `description` use the note's first heading or line.
+- The block opens with one line telling agents to open a linked note when a task touches its topic, and that note files are the source of truth.
+- `--block hybrid|index|full` on `init`, `sync` and `doctor` overrides the setting for one run.
+- `doctor` reports the block mode, inlined/indexed counts, size in bytes and approximate tokens (~4 characters per token), and warns above 8 KB. It also warns about an unknown `"block"` value.
+- Scrubbing still runs on the whole block, so it covers inlined rules and index descriptions. CRLF files and idempotent writes behave as in 0.2.
+- Upgrading changes the `AGENTS.md` block of git-mode projects on the next sync. Set `"block": "full"` to keep the 0.2 output.
+
 ## 0.2.0
 
 Windows support. macOS and Linux behaviour is unchanged.

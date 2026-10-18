@@ -78,7 +78,41 @@ docs/ai-context/
 .cursor/rules/ai-memory.mdc   alwaysApply rule
 ```
 
-`ai-memory-sync sync` merges every note (frontmatter stripped, grouped by source) into a block between `<!-- BEGIN:ai-memory ... -->` and `<!-- END:ai-memory -->`. Content outside the markers is never touched, other generated blocks (for example the Next.js agent-rules block) are preserved, and files are written only when their content changes.
+`ai-memory-sync sync` builds a block between `<!-- BEGIN:ai-memory ... -->` and `<!-- END:ai-memory -->` from the notes (frontmatter stripped, sensitive data scrubbed). Content outside the markers is never touched, other generated blocks (for example the Next.js agent-rules block) are preserved, and files are written only when their content changes.
+
+### Block size: hybrid, index or full
+
+Every tool loads the block at the start of every session, so its size is a per-session token cost that grows with each note. The `"block"` setting decides what is inlined:
+
+| `"block"` | Inlined in full | Everything else | Typical cost |
+|---|---|---|---|
+| `hybrid` (default) | behavior rules: notes with `type: feedback` or `type: user` (top level or under `metadata:`, as Claude Code writes them), plus pinned notes | one index line per note | small and stable: rules are short, the index grows one line per note |
+| `index` | pinned notes only | one index line per note | smallest |
+| `full` | every note, grouped by source (the 0.2 layout, byte for byte) | | grows with every note |
+
+An index line looks like this, with the path relative to the repo root so any agent can open it:
+
+```md
+- **project-stack**: stack, hosts and deploy targets → `docs/ai-context/memory/claude/project-stack.md`
+```
+
+The text after the name is the note's `description`, or its first heading or line when it has none. The block starts with one line telling agents to open the linked note when a task touches that topic, and that the note files are the source of truth.
+
+Frontmatter flags, for any note:
+
+- `pin: true` inlines the note in `hybrid` and `index` mode.
+- `pin: false` keeps a rule as an index line in `hybrid` mode.
+
+For Claude Code notes, set the flag in the source note in `~/.claude/projects/<slug>/memory/`: the repo copy is overwritten on each sync. `full` ignores both flags.
+
+The tradeoff: `full` puts everything in front of the agent but costs tokens in every session, even when a task never touches most notes. `hybrid` keeps the rules that change behavior always loaded and makes the agent read a note (one file read) only when the task needs it. A real project with 11 notes went from about 18.9 KB (~4,700 tokens per session) in `full` to about 3.5 KB (~860 tokens) in `hybrid`.
+
+```sh
+ai-memory-sync sync --block full     # render one way for this run only (also init, doctor)
+ai-memory-sync doctor                # shows "block: hybrid (2 inlined, 9 indexed); 3464 bytes, ~858 tokens per session"
+```
+
+`--block` is a one-run override; hooks use `"block"` from `.ai-memory-sync.json`, so set it there to keep it. `doctor` warns when the block is over 8 KB. Upgrading from 0.2 switches projects to `hybrid` on the next sync; set `"block": "full"` to keep the old output.
 
 Where the block goes:
 
@@ -104,12 +138,12 @@ Hooks never scaffold your home folder or temp directories, and `AI_MEMORY_SYNC=0
 ## Commands
 
 ```sh
-ai-memory-sync init [path]       # scaffold (idempotent)
-ai-memory-sync sync [path]       # copy memories in, scrub, rebuild the block
+ai-memory-sync init [path] [--block hybrid|index|full]   # scaffold (idempotent)
+ai-memory-sync sync [path] [--block hybrid|index|full]   # copy memories in, scrub, rebuild the block
 ai-memory-sync mode [local|git|off] [path] [--yes] [--force]
 ai-memory-sync scan [--root ~/Developer] [--apply] [--all] [--depth 5]
 ai-memory-sync install | uninstall
-ai-memory-sync doctor [path]
+ai-memory-sync doctor [path] [--block hybrid|index|full] # wiring, state, block size
 ```
 
 `scan` lists git repos and marks the ones that already have Claude memory or a `docs/ai-context/` folder. `--apply` sets those up (local mode unless they are already in git mode). Repos with neither are skipped unless you pass `--all`.
@@ -121,6 +155,7 @@ ai-memory-sync doctor [path]
 ```json
 {
   "mode": "git",
+  "block": "hybrid",
   "claudeMemoryDirs": ["~/.claude/projects/-Users-me-Work/memory"],
   "codexMemoryDirs": [],
   "cursorMemoryDirs": [],
@@ -129,6 +164,7 @@ ai-memory-sync doctor [path]
 }
 ```
 
+- `block`: `hybrid` (default), `index` or `full`; see [Block size](#block-size-hybrid-index-or-full).
 - `claudeMemoryDirs`: extra memory folders, e.g. when you start Claude Code in a parent folder of the repo.
 - `copy`: extra `.md` folders to mirror (scrubbed).
 - `envAllowKeys`: `.env` keys whose values are not secret and may stay in notes.
@@ -188,6 +224,8 @@ npx github:leulfonseca/ai-memory-sync install
 - `off`: nada acontece.
 
 **Como funciona.** O Claude Code recebe um plugin com hooks (início de sessão, escrita na memória, fim de turno). O Codex recebe `notify` encadeado, hooks em `~/.codex/hooks.json` e uma instrução no `~/.codex/AGENTS.md`. O Cursor recebe hooks em `~/.cursor/hooks.json`. Clones novos recebem um `post-checkout` via `init.templateDir`, que prepara o projeto em modo local, sem commits.
+
+**Tamanho do bloco.** O bloco é carregado em toda sessão. No modo `hybrid` (padrão), só as regras de comportamento (`type: feedback` ou `user`) e as notas com `pin: true` entram completas; as demais viram uma linha de índice com o caminho do arquivo, que o agente abre quando a tarefa toca no assunto. `"block": "index"` deixa só as fixadas, e `"block": "full"` reproduz o formato da 0.2. `ai-memory-sync doctor` mostra o tamanho em bytes e tokens aproximados.
 
 **Privacidade.** O scrubbing está sempre ativo. Chaves de API, JWTs, chaves privadas, senhas, URLs com credenciais, tokens Bearer, e-mails, telefones, strings de alta entropia e valores dos arquivos `.env*` viram `[REDACTED:<tipo>]`. Os arquivos de origem em `~/.claude` nunca são modificados.
 

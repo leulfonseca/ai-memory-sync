@@ -1,6 +1,6 @@
 {
   "name": "ai-memory-sync",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Keep AI coding-assistant memories inside each project's repo, readable natively by Claude Code, Codex and Cursor. Sensitive data is scrubbed automatically.",
   "type": "module",
   "bin": { "ai-memory-sync": "plugins/ai-memory-sync/bin/ai-memory-sync.mjs" },

@@ -7,6 +7,8 @@ import { createInterface } from "node:readline/promises";
 import { fileURLToPath } from "node:url";
 import { doctorGlobal, install, uninstall } from "../lib/install.mjs";
 import {
+  BLOCK_MODES,
+  BLOCK_WARN_BYTES,
   CTX,
   LOCAL_FILES,
   MDC,
@@ -46,6 +48,8 @@ const HELP = `ai-memory-sync ${VERSION}
 Usage:
   ai-memory-sync init [path]                 scaffold docs/ai-context and the generated files (idempotent)
   ai-memory-sync sync [path]                 copy tool memories in, scrub, rebuild the memory block
+        --block hybrid|index|full            render the block this way for this run only (init, sync, doctor);
+                                             set "block" in .ai-memory-sync.json to keep it (default hybrid)
   ai-memory-sync mode [local|git|off] [path] show or switch the project's mode (git asks to confirm)
         --yes                                skip the confirmation prompt
         --force                              allow git mode on a public (or unknown) remote
@@ -53,7 +57,7 @@ Usage:
                                              find git repos that use AI memory; --apply sets them up
   ai-memory-sync install                     wire Claude Code, Codex, Cursor and git clones (backs up edits)
   ai-memory-sync uninstall                   undo install (backups are kept)
-  ai-memory-sync doctor [path]               report global wiring and the project's state
+  ai-memory-sync doctor [path]               report global wiring, the project's state and the block size
 
 Modes: local (default; memory stays out of git), git (memory committed with the project), off.
 Set AI_MEMORY_SYNC=0 to disable every hook for one command or session.`;
@@ -64,7 +68,15 @@ const opt = (name, dflt) => {
   const i = argv.indexOf(name);
   return i >= 0 && argv[i + 1] && !argv[i + 1].startsWith("--") ? argv[i + 1] : dflt;
 };
-const positional = argv.filter((a, i) => !a.startsWith("--") && !["--root", "--depth", "--source"].includes(argv[i - 1]));
+const positional = argv.filter((a, i) => !a.startsWith("--") && !["--root", "--depth", "--source", "--block"].includes(argv[i - 1]));
+
+/** `--block <mode>` override, validated; undefined when absent (the project config decides). */
+function blockFlag() {
+  if (!argv.includes("--block")) return undefined;
+  const v = opt("--block", null);
+  if (!BLOCK_MODES.includes(v)) throw new Error(`--block needs one of ${BLOCK_MODES.join(", ")}`);
+  return v;
+}
 
 const redactionSummary = (counts) => {
   const parts = Object.entries(counts).map(([k, n]) => `${k}×${n}`);
@@ -255,9 +267,17 @@ function cmdDoctor(p) {
   for (const d of src.claude) console.log(`  claude source: ${d} ${existsSync(d) ? "(exists)" : "(missing)"}`);
   for (const d of [...src.codex, ...src.cursor]) console.log(`  extra source: ${d} ${existsSync(d) ? "(exists)" : "(missing)"}`);
   console.log(`  scaffold: ${isDir(join(root, MEM)) ? "present" : "missing (run init)"}`);
-  const pl = plan(root, mode);
+  const pl = plan(root, mode, { block: blockFlag() });
   const stale = pl.files.filter((f) => f.content != null && readText(f.path) !== f.content).map((f) => f.path);
   console.log(`  notes: ${pl.notes}; generated files ${stale.length ? `out of date: ${stale.join(", ")} (run sync)` : "up to date"}`);
+  const b = pl.built;
+  const bytes = Buffer.byteLength(b.block);
+  const split = b.mode === "full" ? "all inlined" : `${b.inlined} inlined, ${b.indexed} indexed`;
+  console.log(`  block: ${b.mode} (${split}); ${bytes} bytes, ~${Math.round(b.block.length / 4)} tokens per session`);
+  if (bytes > BLOCK_WARN_BYTES) {
+    const hint = b.mode === "index" ? "move detail out of pinned and rule notes" : b.mode === "full" ? 'try "block": "hybrid"' : 'try "block": "index", or unpin notes';
+    console.log(`  warning: block is over ${BLOCK_WARN_BYTES / 1024} KB and loads into every session; ${hint}`);
+  }
   for (const w of pl.warnings) console.log(`  warning: ${w}`);
   if (mode === "local") {
     const leaked = [CTX, MDC, ...LOCAL_FILES].filter((f) => git(root, ["ls-files", "--", f]));
@@ -384,9 +404,9 @@ async function main() {
   const [cmd, a1, a2] = positional;
   switch (cmd) {
     case "init":
-      return printResult(init(projectRoot(a1)), "init");
+      return printResult(init(projectRoot(a1), { block: blockFlag() }), "init");
     case "sync":
-      return printResult(sync(projectRoot(a1)), "sync");
+      return printResult(sync(projectRoot(a1), { block: blockFlag() }), "sync");
     case "mode":
       return cmdMode();
     case "scan":

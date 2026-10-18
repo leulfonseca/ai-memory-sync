@@ -224,7 +224,7 @@ function mkRepo(name) {
   const mem = join(fakeHome, ".claude", "projects", claudeSlug(r), "memory");
   mkdirSync(mem, { recursive: true });
   writeFileSync(join(mem, "MEMORY.md"), "- [Fact](fact.md)\n");
-  writeFileSync(join(mem, "fact.md"), `---\nname: fact\ndescription: a fact\n---\n\nUse port 3000. password: Abc12345xyz. env ${readFileSync(join(r, ".env.local"), "utf8").split("=")[1].trim()}\n`);
+  writeFileSync(join(mem, "fact.md"), `---\nname: fact\ndescription: a fact\nmetadata:\n  type: feedback\n---\n\nUse port 3000. password: Abc12345xyz. env ${readFileSync(join(r, ".env.local"), "utf8").split("=")[1].trim()}\n`);
   return { r, mem };
 }
 
@@ -324,6 +324,150 @@ t("symlink checked out as a text file (core.symlinks=false) is not overwritten",
   P.switchMode(r, "git", () => {});
   assert.equal(readFileSync(join(r, "CLAUDE.md"), "utf8"), "AGENTS.md");
   assert.ok(readFileSync(join(r, "AGENTS.md"), "utf8").includes(P.BEGIN));
+});
+
+// ---------- block modes ----------
+/** A project folder with notes of every kind (no git needed for buildBlock). */
+function mkNotes(name, config) {
+  const r = join(sandbox, name);
+  const w = (rel, text) => {
+    mkdirSync(join(r, rel, ".."), { recursive: true });
+    writeFileSync(join(r, rel), text);
+  };
+  const lit = "envliteral_" + rnd(10);
+  w(".env", `DB_PASS=${lit}\n`);
+  w(`${P.MEM}/claude/MEMORY.md`, "- [x](x.md)\n");
+  w(`${P.MEM}/claude/README.md`, "# readme\n");
+  w(`${P.MEM}/claude/feedback-tabs.md`, '---\nname: tabs\ndescription: "Use tabs, not \\"spaces\\""\nmetadata:\n  node_type: memory\n  type: feedback\n---\n\n# Why\nTabs everywhere. password: Hunter2xyz9\n');
+  w(`${P.MEM}/claude/user-role.md`, "---\nname: role\ndescription: who the user is\ntype: user\n---\n\nSenior dev, prefers short answers.\n");
+  w(`${P.MEM}/claude/project-stack.md`, `---\nname: stack\ndescription: stack and hosts, mail ops@example.com, db ${lit}\nmetadata:\n  type: project\n---\n\nLong project detail that must not be inlined.\n`);
+  w(`${P.MEM}/claude/project-pinned.md`, "---\nname: pinned\ndescription: always here\ntype: project\npin: true\n---\n\nPinned body text.\n");
+  w(`${P.MEM}/claude/feedback-unpinned.md`, "---\nname: unpinned\ndescription: rule kept out\ntype: feedback\npin: false\n---\n\nUnpinned rule body.\n");
+  w(`${P.MEM}/claude/reference-docs.md`, "---\nname: docs\ndescription: where docs live\nmetadata:\n  type: reference\n---\n\nReference body.\n");
+  w(`${P.MEM}/shared/untyped.md`, "# Deploy checklist\n\nUntyped body text.\n");
+  w(`${P.MEM}/codex/bare.md`, "\n");
+  if (config) w(P.CONFIG_FILE, JSON.stringify(config));
+  return { r, lit };
+}
+
+t("parseNote reads type and pin from top level or metadata", () => {
+  const a = P.parseNote("---\nname: a\nmetadata:\n  type: Feedback\n  pin: yes\n---\nx\n", "a.md");
+  assert.equal(a.type, "feedback");
+  assert.equal(a.pin, true);
+  const b = P.parseNote("---\ntype: project\npin: false\ndescription: 'it''s'\n---\nx\n", "b.md");
+  assert.deepEqual([b.type, b.pin, b.summary], ["project", false, "it's"]);
+  const c = P.parseNote("no frontmatter\n", "c.md");
+  assert.deepEqual([c.name, c.type, c.pin], ["c", "", null]);
+  assert.equal(P.parseNote('---\ndescription: "say \\"hi\\""\n---\n', "d.md").summary, 'say "hi"');
+});
+
+t("hybrid (default): rules and pins inlined, everything else one index line with its repo path", () => {
+  const { r, lit } = mkNotes("block-hybrid");
+  const b = P.buildBlock(r);
+  assert.equal(b.mode, "hybrid");
+  assert.deepEqual([b.notes, b.inlined, b.indexed], [8, 3, 5]);
+  const x = b.block;
+  assert.ok(x.startsWith(P.BEGIN) && x.endsWith(P.END));
+  assert.ok(x.includes("open the linked file") && x.includes("source of truth"), "instruction line");
+  assert.ok(x.includes('#### tabs (Use tabs, not "spaces")'), "feedback note inlined with unescaped description");
+  assert.ok(x.includes("##### Why\nTabs everywhere."), "body headings demoted, frontmatter stripped");
+  assert.ok(!x.includes("node_type"));
+  assert.ok(x.includes("#### role (who the user is)\n\nSenior dev"));
+  assert.ok(x.includes("#### pinned (always here)\n\nPinned body text."), "pin: true inlines a project note");
+  assert.ok(x.includes("- **unpinned**: rule kept out → `docs/ai-context/memory/claude/feedback-unpinned.md`"), "pin: false indexes a rule");
+  assert.ok(!x.includes("Unpinned rule body") && !x.includes("Long project detail") && !x.includes("Reference body"));
+  assert.ok(x.includes("- **docs**: where docs live → `docs/ai-context/memory/claude/reference-docs.md`"));
+  assert.ok(x.includes("- **untyped**: Deploy checklist → `docs/ai-context/memory/shared/untyped.md`"), "untyped note: first heading as summary");
+  assert.ok(x.includes("- **bare** → `docs/ai-context/memory/codex/bare.md`"), "empty note still indexed");
+  assert.ok(!x.includes("MEMORY.md") && !x.includes("# readme"));
+  // scrubbing covers inlined rules and index descriptions
+  assert.ok(x.includes("[REDACTED:secret]") && !x.includes("Hunter2xyz9"));
+  assert.ok(x.includes("[REDACTED:email]") && x.includes("[REDACTED:env]") && !x.includes(lit));
+  assert.ok(x.indexOf("### Rules") < x.indexOf("### Index"));
+  assert.equal(P.buildBlock(r).block, x, "deterministic");
+});
+
+t("index: only pinned notes inlined", () => {
+  const { r } = mkNotes("block-index", { block: "index" });
+  const b = P.buildBlock(r);
+  assert.deepEqual([b.mode, b.inlined, b.indexed], ["index", 1, 7]);
+  assert.ok(b.block.includes("#### pinned (always here)"));
+  assert.ok(b.block.includes("- **tabs**: Use tabs, not \"spaces\" → `docs/ai-context/memory/claude/feedback-tabs.md`"));
+  assert.ok(!b.block.includes("Tabs everywhere"));
+});
+
+t("full: v0.2 layout, every note inlined by section, pin ignored", () => {
+  const { r } = mkNotes("block-full", { block: "full" });
+  const b = P.buildBlock(r);
+  assert.deepEqual([b.mode, b.inlined, b.indexed], ["full", 8, 0]);
+  const x = b.block;
+  assert.ok(!x.includes("### Index") && !x.includes("open the linked file"));
+  assert.ok(x.includes("\n### Shared\n\n#### untyped\n\n##### Deploy checklist\n\nUntyped body text.\n"));
+  assert.ok(x.includes("### From Claude Code") && x.includes("### From Codex"));
+  assert.ok(x.includes('#### tabs (Use tabs, not \\"spaces\\")'), "v0.2 kept the raw description");
+  assert.ok(x.includes("Unpinned rule body") && x.includes("Long project detail"));
+  assert.ok(x.indexOf("### Shared") < x.indexOf("### From Claude Code"));
+  assert.equal(P.buildBlock(r, { block: "hybrid" }).mode, "hybrid", "override beats the config");
+});
+
+t("empty memory renders the same placeholder in every mode", () => {
+  const r = join(sandbox, "block-empty");
+  mkdirSync(join(r, P.MEM, "shared"), { recursive: true });
+  for (const m of P.BLOCK_MODES) assert.ok(P.buildBlock(r, { block: m }).block.includes("\n_No notes yet._\n"));
+});
+
+t("unknown block value falls back to hybrid with a warning", () => {
+  const { r } = mkNotes("block-bad", { block: "tiny" });
+  const p = P.plan(r, "git");
+  assert.equal(p.built.mode, "hybrid");
+  assert.ok(p.warnings.some((w) => w.includes('unknown "block"')));
+});
+
+t("git mode hybrid: idempotent, CRLF kept, switching modes rewrites only the block", () => {
+  const { r, mem } = mkRepo("hybrid-crlf-repo");
+  writeFileSync(join(r, "AGENTS.md"), "# Team rules\r\n\r\nHand-written.\r\n");
+  writeFileSync(join(mem, "proj.md"), "---\r\nname: proj\r\ndescription: crlf project note\r\nmetadata:\r\n  type: project\r\n---\r\n\r\nBody.\r\n");
+  P.switchMode(r, "git", () => {});
+  const a = readFileSync(join(r, "AGENTS.md"), "utf8");
+  assert.ok(!/[^\r]\n/.test(a), "all line endings CRLF");
+  assert.ok(a.startsWith("# Team rules\r\n\r\nHand-written.\r\n"), "hand-written part untouched");
+  assert.ok(a.includes("#### fact (a fact)") && a.includes("- **proj**: crlf project note → `docs/ai-context/memory/claude/proj.md`"));
+  assert.deepEqual(P.sync(r).changed, [], "no churn");
+  assert.deepEqual(P.sync(r).changed, []);
+  writeFileSync(join(r, P.CONFIG_FILE), JSON.stringify({ mode: "git", block: "full" }));
+  assert.deepEqual(P.sync(r).changed, ["AGENTS.md"]);
+  const f = readFileSync(join(r, "AGENTS.md"), "utf8");
+  assert.ok(f.includes("#### proj (crlf project note)\r\n\r\nBody.") && !/[^\r]\n/.test(f));
+  assert.equal(f.slice(0, f.indexOf(P.BEGIN_PREFIX)), a.slice(0, a.indexOf(P.BEGIN_PREFIX)));
+  assert.deepEqual(P.sync(r).changed, []);
+});
+
+t("local mode hybrid: same block in AGENTS.local.md, the override and the Cursor rule", () => {
+  const { r } = mkRepo("hybrid-local-repo");
+  P.init(r);
+  P.sync(r);
+  const block = P.buildBlock(r).block;
+  for (const f of ["AGENTS.local.md", "AGENTS.override.md", P.MDC]) assert.ok(readFileSync(join(r, f), "utf8").includes(block), f);
+  assert.equal(gitc(r, "status", "--porcelain"), "");
+});
+
+t("CLI: --block override, doctor reports size and warns over 8 KB", () => {
+  const cliPath = fileURLToPath(new URL("../plugins/ai-memory-sync/bin/ai-memory-sync.mjs", import.meta.url));
+  const run = (...a) => execFileSync(process.execPath, [cliPath, ...a], { encoding: "utf8", env: { ...process.env } });
+  const { r } = mkRepo("cli-block-repo");
+  P.switchMode(r, "git", () => {});
+  const mem = join(r, P.MEM, "shared");
+  for (let i = 0; i < 12; i++) writeFileSync(join(mem, `big-${i}.md`), `---\nname: big${i}\ntype: project\n---\n\n${"Long prose line about the project. ".repeat(30)}\n`);
+  run("sync", r);
+  let d = run("doctor", r);
+  assert.match(d, /block: hybrid \(1 inlined, 12 indexed\); \d+ bytes, ~\d+ tokens per session/);
+  assert.ok(!d.includes("block is over"), d);
+  assert.match(run("sync", r, "--block", "full"), /changed 1: AGENTS\.md/);
+  d = run("doctor", r, "--block", "full");
+  assert.match(d, /block: full \(all inlined\); \d+ bytes/);
+  assert.ok(d.includes("warning: block is over 8 KB"), d);
+  assert.ok(run("doctor", r).includes("out of date"), "the config (hybrid) still decides for hooks");
+  assert.throws(() => execFileSync(process.execPath, [cliPath, "sync", r, "--block", "huge"], { stdio: "pipe" }));
 });
 
 t("Codex global notes match the project path with either separator", () => {

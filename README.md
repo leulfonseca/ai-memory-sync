@@ -3,11 +3,44 @@
 Keep your AI coding assistants' long-term memory **inside each project**, in a format that Claude Code, OpenAI Codex and Cursor all read natively. Every tool sees the notes of the others, a new machine starts with the same context, and sensitive data is scrubbed automatically.
 
 - Zero runtime dependencies, Node.js 20 or newer, MIT license.
+- macOS, Linux and Windows (PowerShell, cmd and Git Bash), tested in CI on all three.
 - One command wires every tool installed on the machine; one command undoes it.
 
 ```sh
 npx github:leulfonseca/ai-memory-sync install
 ```
+
+### Windows
+
+Requirements: [Node.js 20+](https://nodejs.org) on `PATH` and [Git for Windows](https://git-scm.com/downloads/win). Claude Code needs Git for Windows too, and runs plugin hooks in Git Bash.
+
+```powershell
+# PowerShell (or cmd). If PowerShell blocks npx.ps1, use npx.cmd instead of npx.
+npx github:leulfonseca/ai-memory-sync install
+ai-memory-sync doctor
+```
+
+If `ai-memory-sync` is not found afterwards, add the shim folder to your user `PATH` once (the installer prints this line too) and open a new terminal:
+
+```powershell
+[Environment]::SetEnvironmentVariable('Path', [Environment]::GetEnvironmentVariable('Path','User') + ";$env:USERPROFILE\.ai-memory-sync\bin", 'User')
+```
+
+What `install` writes on Windows (`~` is `%USERPROFILE%`):
+
+| Path | What |
+|---|---|
+| `~\.ai-memory-sync\app\` | a copy of the CLI |
+| `~\.ai-memory-sync\bin\ai-memory-sync.cmd` | shim for cmd and PowerShell (no `.ps1`, so no execution-policy prompt); also copied to `~\.local\bin\` when that folder exists (Claude Code's native installer puts it on `PATH`) |
+| `~\.ai-memory-sync\bin\ai-memory-sync` | sh shim for Git Bash |
+| `~\.codex\config.toml` (or `%CODEX_HOME%`) | `notify = ["C:\\...\\node.exe", "...\\ai-memory-sync.mjs", "codex-notify", "--", <your old notify>...]` |
+| `~\.codex\hooks.json`, `~\.cursor\hooks.json` | hook commands of the form `node "C:/Users/you/.ai-memory-sync/app/bin/ai-memory-sync.mjs" hook ...`, which parse the same in cmd, PowerShell and Git Bash |
+| `~\.codex\AGENTS.md` | the note telling Codex where to save memory |
+| `~\.ai-memory-sync\git-template\hooks\post-checkout` | POSIX sh hook with LF endings; Git for Windows runs it with its own sh |
+| `~\.gitconfig` | `init.templateDir = C:/Users/you/.ai-memory-sync/git-template` |
+| Claude Code | the plugin, through `claude plugin marketplace add` / `claude plugin install` |
+
+Claude Code's project memory lives in `~\.claude\projects\<slug>\memory`, where `C:\Users\you\proj` becomes `C--Users-you-proj`. Node.js upgrades that move `node.exe` need `ai-memory-sync install` again; `doctor` flags it.
 
 ## Three modes per project
 
@@ -64,7 +97,7 @@ Where the block goes:
 | Cursor | User hooks in `~/.cursor/hooks.json` (existing hooks are kept). | `sessionStart`, `afterFileEdit` in `docs/ai-context/memory/`, `stop` |
 | git clones | `init.templateDir` with a `post-checkout` hook (merged into your template dir if you already have one). | first checkout after a clone: scaffolds in **local** mode only, so no tracked file changes and no commits |
 
-Claude Code stores project memory in `~/.claude/projects/<slug>/memory/*.md`, where `<slug>` is the absolute project path with every non-alphanumeric character replaced by `-` (`/Users/me/CRM + App` becomes `-Users-me-CRM---App`). The source files in `~/.claude` are only read, never modified. Copies are never deleted, because teammates' notes live in the same folder.
+Claude Code stores project memory in `~/.claude/projects/<slug>/memory/*.md`, where `<slug>` is the absolute project path (the git root) with every non-alphanumeric character replaced by `-` (`/Users/me/CRM + App` becomes `-Users-me-CRM---App`, `C:\Users\me\app` becomes `C--Users-me-app`). Slugs longer than 200 characters are cut and get a hash suffix, as Claude Code does. The source files in `~/.claude` are only read, never modified. Copies are never deleted, because teammates' notes live in the same folder.
 
 Hooks never scaffold your home folder or temp directories, and `AI_MEMORY_SYNC=0` disables everything.
 
@@ -127,11 +160,14 @@ ai-memory-sync uninstall
 
 It removes the Claude plugin and marketplace, restores the original Codex `notify` command, removes only the hook entries and sections it added, unsets `init.templateDir` if it set it, and deletes `~/.ai-memory-sync`. Every file it edits is backed up first as `<file>.bak-ai-memory-sync-<timestamp>`. Project files are left in place.
 
+On Windows, run the same command in PowerShell or cmd. It also removes `~\.local\bin\ai-memory-sync.cmd`. If you added `~\.ai-memory-sync\bin` to your user `PATH`, remove it in *Settings > System > About > Advanced system settings > Environment Variables*.
+
 ## Known limits
 
 - **Codex** asks you to approve new hooks once (`/hooks`). Until then, the chained `notify` command keeps memory in sync after each turn. `AGENTS.override.md` (local mode) counts toward Codex's 32 KiB `project_doc_max_bytes` and is refreshed on each sync, so it can lag one turn behind edits to `AGENTS.md`.
 - **Cursor** has no local override for `AGENTS.md`. Cursor on macOS has been reported to skip rule files listed in `.git/info/exclude`, so local mode also injects the memory through the `sessionStart` hook. Cursor's own "Memories" live in its cloud and cannot be copied.
 - **Claude Code**: the plugin needs network once to install from GitHub; after that it runs offline from the plugin cache.
+- **Windows**: Claude Code runs plugin hooks in Git Bash; without Git for Windows it falls back to PowerShell and the plugin's `sh` hooks do not run. Codex and Cursor hooks call `node` by name, so Node.js must be on `PATH`. Paths containing `%`, `$` or a backtick are not supported in hook commands (shells expand them); `doctor` warns.
 
 ---
 
@@ -139,7 +175,7 @@ It removes the Claude plugin and marketplace, restores the original Codex `notif
 
 **ai-memory-sync** guarda a memória de longo prazo dos assistentes de código (Claude Code, Codex, Cursor) dentro de cada projeto, num formato que as três ferramentas leem nativamente. Dados sensíveis são removidos automaticamente.
 
-Instalar com um comando:
+Instalar com um comando (macOS, Linux ou Windows; no Windows use PowerShell ou cmd, com Node.js 20+ e Git for Windows):
 
 ```sh
 npx github:leulfonseca/ai-memory-sync install

@@ -1,0 +1,10 @@
+{
+  "name": "ai-memory-sync",
+  "version": "0.1.0",
+  "description": "Keeps AI coding-assistant memories inside each project's repo, readable by Claude Code, Codex and Cursor. Scrubs sensitive data.",
+  "author": { "name": "Leul Fonseca", "url": "https://github.com/leulfonseca" },
+  "homepage": "https://github.com/leulfonseca/ai-memory-sync",
+  "repository": "https://github.com/leulfonseca/ai-memory-sync",
+  "license": "MIT",
+  "keywords": ["memory", "agents", "codex", "cursor", "agents-md"]
+}

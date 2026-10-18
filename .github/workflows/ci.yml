@@ -33,6 +33,7 @@ jobs:
       - name: Unit tests
         run: node test/run.mjs
       - name: Install / doctor / hooks / uninstall smoke test (fake HOME and USERPROFILE)
+        if: success() || failure()
         run: node test/smoke.mjs
       - name: CLI help from PowerShell and cmd
         if: runner.os == 'Windows'

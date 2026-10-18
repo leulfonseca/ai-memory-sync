@@ -298,7 +298,7 @@ t("codex notify chain round-trips", () => {
   const orig = 'notify = ["/x/y z/app", "turn-ended"]\nmodel = "m"\n\n[t]\nnotify = "not top-level"\n';
   const chained = I.notifyWithChain(orig, I.notifyPrefix(false));
   assert.ok(chained.startsWith(`notify = [${JSON.stringify(I.SHIM)}, "codex-notify", "--", "/x/y z/app", "turn-ended"]`));
-  assert.equal(I.notifyWithChain(chained), chained);
+  assert.equal(I.notifyWithChain(chained, I.notifyPrefix(false)), chained, "idempotent");
   assert.equal(I.notifyWithoutChain(chained), orig);
   assert.equal(I.notifyWithoutChain(I.notifyWithChain('model = "m"\n')), 'model = "m"\n');
 });
